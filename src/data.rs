@@ -84,6 +84,7 @@ impl Default for DlSettings {
 pub struct AppSettings {
     pub dl: DlSettings,
     pub data_filters: Vec<String>,
+    pub ma: Vec<usize>,
 }
 
 fn default_data_dir() -> String {
@@ -101,11 +102,16 @@ fn default_data_filters() -> Vec<String> {
     Vec::new()
 }
 
+fn default_ma() -> Vec<usize> {
+    vec![10, 30, 60]
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             dl: DlSettings::default(),
             data_filters: default_data_filters(),
+            ma: default_ma(),
         }
     }
 }
@@ -113,7 +119,7 @@ impl Default for AppSettings {
 #[derive(Deserialize, Default)]
 struct LegacyAppSettings {
     #[serde(default)]
-    dl: Option<DlSettings>,
+    dl: Option<LegacyDl>,
     #[serde(default = "default_data_dir")]
     data_dir: String,
     #[serde(default = "default_stock_dl_binary")]
@@ -122,6 +128,25 @@ struct LegacyAppSettings {
     concurrency: usize,
     #[serde(default = "default_data_filters")]
     data_filters: Vec<String>,
+    #[serde(default)]
+    ma: Option<Vec<usize>>,
+    // Legacy top-level alias for `ma`.
+    #[serde(default)]
+    ma_windows: Option<Vec<usize>>,
+}
+
+/// Mirrors `DlSettings` but also tolerates the legacy `ma_windows` key so we
+/// can migrate it up to the top-level `ma` field if present.
+#[derive(Deserialize)]
+struct LegacyDl {
+    #[serde(default = "default_data_dir")]
+    data_dir: String,
+    #[serde(default = "default_stock_dl_binary")]
+    binary: String,
+    #[serde(default = "default_concurrency")]
+    concurrency: usize,
+    #[serde(default)]
+    ma_windows: Option<Vec<usize>>,
 }
 
 impl<'de> Deserialize<'de> for AppSettings {
@@ -130,15 +155,39 @@ impl<'de> Deserialize<'de> for AppSettings {
         D: serde::Deserializer<'de>,
     {
         let legacy = LegacyAppSettings::deserialize(deserializer)?;
-        let dl = legacy.dl.unwrap_or_else(|| DlSettings {
-            data_dir: legacy.data_dir,
-            binary: legacy.stock_dl_binary,
-            concurrency: legacy.concurrency,
-        });
+        let (dl, dl_ma_windows) = match legacy.dl {
+            Some(d) => (
+                DlSettings {
+                    data_dir: d.data_dir,
+                    binary: d.binary,
+                    concurrency: d.concurrency,
+                },
+                d.ma_windows,
+            ),
+            None => (
+                DlSettings {
+                    data_dir: legacy.data_dir,
+                    binary: legacy.stock_dl_binary,
+                    concurrency: legacy.concurrency,
+                },
+                None,
+            ),
+        };
+
+        // Resolve MA windows from the first location that exists, newest
+        // spelling winning: top-level `ma` → top-level `ma_windows` →
+        // `dl.ma_windows` → default.
+        let ma = legacy
+            .ma
+            .or(legacy.ma_windows)
+            .or(dl_ma_windows)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(default_ma);
 
         Ok(Self {
             dl,
             data_filters: legacy.data_filters,
+            ma,
         })
     }
 }
@@ -310,26 +359,31 @@ pub fn load_stock_list(data_dir: &Path) -> Vec<(StockInfo, PathBuf)> {
     stocks
 }
 
-/// Default MA windows computed on demand (no MA columns in the new data).
-pub const DEFAULT_MA_WINDOWS: &[usize] = &[10, 30, 60];
-
-pub fn load_candles(stock_dir: &Path, period: Period) -> (Vec<Candle>, Vec<MaLine>) {
+pub fn load_candles(
+    stock_dir: &Path,
+    period: Period,
+    ma_windows: &[usize],
+) -> (Vec<Candle>, Vec<MaLine>) {
     let daily = read_daily_csv(&stock_dir.join("daily.csv"));
     let candles = match period {
         Period::Daily => daily,
         Period::Weekly => aggregate_weekly(&daily),
     };
 
+    let ma_lines = build_ma_lines(&candles, ma_windows);
+
+    (candles, ma_lines)
+}
+
+fn build_ma_lines(candles: &[Candle], ma_windows: &[usize]) -> Vec<MaLine> {
     let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
-    let ma_lines = DEFAULT_MA_WINDOWS
+    ma_windows
         .iter()
         .map(|&p| MaLine {
             period: p,
             values: calculate_ma(&closes, p),
         })
-        .collect();
-
-    (candles, ma_lines)
+        .collect()
 }
 
 fn read_daily_csv(csv_path: &Path) -> Vec<Candle> {
@@ -542,12 +596,34 @@ fn parse_filter_operand(s: &str) -> Result<FilterOperand, String> {
     Ok(FilterOperand { column, offset })
 }
 
-pub fn evaluate_filters_on_stock(stock_dir: &Path, filters: &[DataFilter]) -> bool {
+pub fn evaluate_filters_on_stock(
+    stock_dir: &Path,
+    filters: &[DataFilter],
+    ma_windows: &[usize],
+) -> bool {
     if filters.is_empty() {
         return true;
     }
 
-    let (candles, ma_lines) = load_candles(stock_dir, Period::Daily);
+    // Union configured windows with any `maN` references in the filters so
+    // expressions like `ma120 > ma240` resolve even if those periods aren't
+    // in the user's chart config.
+    let mut windows: Vec<usize> = ma_windows.to_vec();
+    for f in filters {
+        for operand in [&f.left, &f.right] {
+            if let Some(p) = operand
+                .column
+                .strip_prefix("ma")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if !windows.contains(&p) {
+                    windows.push(p);
+                }
+            }
+        }
+    }
+
+    let (candles, ma_lines) = load_candles(stock_dir, Period::Daily, &windows);
     if candles.is_empty() {
         return false;
     }
@@ -704,17 +780,59 @@ mod tests {
         assert_eq!(parsed.dl.binary, "stock-dl");
         assert_eq!(parsed.dl.concurrency, 8);
         assert_eq!(parsed.data_filters, vec!["price > ma60".to_string()]);
+        assert_eq!(parsed.ma, vec![10, 30, 60]);
+    }
+
+    #[test]
+    fn ma_config_is_read_from_top_level() {
+        let json = r#"{
+          "dl": { "data_dir": "/d", "binary": "stock-dl" },
+          "ma": [10, 30, 60, 120, 240]
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.ma, vec![10, 30, 60, 120, 240]);
+    }
+
+    #[test]
+    fn ma_config_migrates_from_dl_ma_windows() {
+        // Older settings stored MA windows under dl.ma_windows. Make sure those
+        // surface as the new top-level `ma` so users don't lose their config.
+        let json = r#"{
+          "dl": {
+            "data_dir": "/d",
+            "binary": "stock-dl",
+            "ma_windows": [5, 20, 60]
+          }
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.ma, vec![5, 20, 60]);
+    }
+
+    #[test]
+    fn ma_config_migrates_from_top_level_ma_windows() {
+        let json = r#"{
+          "dl": { "data_dir": "/d", "binary": "stock-dl" },
+          "ma_windows": [7, 14, 28]
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.ma, vec![7, 14, 28]);
+    }
+
+    #[test]
+    fn empty_ma_config_falls_back_to_default() {
+        let json = r#"{ "ma": [] }"#;
+        let parsed: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.ma, vec![10, 30, 60]);
     }
 
     #[test]
     fn parses_legacy_settings_with_dropped_fields_ignored() {
-        // Older settings files may still have ma_windows/source/periods. These
+        // Older settings files may still have source/periods/include_st. These
         // must not cause a parse failure.
         let legacy = r#"{
           "dl": {
             "data_dir": "/some/dir",
             "binary": "stock-dl",
-            "ma_windows": [10,30,60],
             "source": "akshare",
             "include_st": false,
             "periods": ["daily"]
@@ -791,13 +909,64 @@ mod tests {
         }
         std::fs::write(dir.join("daily.csv"), csv).unwrap();
 
+        let ma = vec![10, 30, 60];
+
         // price > ma10 should hold on a rising series
         let filters = vec![parse_data_filter("price > ma10").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &filters));
+        assert!(evaluate_filters_on_stock(&dir, &filters, &ma));
 
         // price < ma10 should not hold
         let filters = vec![parse_data_filter("price < ma10").unwrap()];
-        assert!(!evaluate_filters_on_stock(&dir, &filters));
+        assert!(!evaluate_filters_on_stock(&dir, &filters, &ma));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_resolves_ma_outside_configured_windows() {
+        // Even if the user only configures [10, 30, 60], a filter that
+        // references ma5 should still work because the evaluator unions the
+        // filter's MA references into the computed windows.
+        let dir = std::env::temp_dir().join("chart_app_filter_ma_outside");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
+        for i in 1..=12 {
+            csv.push_str(&format!(
+                "2026-01-{:02},{v}.0,{v}.0,{v}.0,{v}.0,100,\n",
+                i,
+                v = i
+            ));
+        }
+        std::fs::write(dir.join("daily.csv"), csv).unwrap();
+
+        let configured = vec![10, 30, 60];
+        let filters = vec![parse_data_filter("price > ma5").unwrap()];
+        assert!(evaluate_filters_on_stock(&dir, &filters, &configured));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_candles_returns_configured_ma_lines() {
+        let dir = std::env::temp_dir().join("chart_app_load_candles_ma");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
+        for i in 1..=20 {
+            csv.push_str(&format!(
+                "2026-01-{:02},{v}.0,{v}.0,{v}.0,{v}.0,100,\n",
+                i,
+                v = i
+            ));
+        }
+        std::fs::write(dir.join("daily.csv"), csv).unwrap();
+
+        let (_candles, ma_lines) = load_candles(&dir, Period::Daily, &[5, 10, 20]);
+        let periods: Vec<usize> = ma_lines.iter().map(|m| m.period).collect();
+        assert_eq!(periods, vec![5, 10, 20]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -41,6 +41,7 @@ struct ChartApp {
     candles: Vec<Candle>,
     ma_lines: Vec<MaLine>,
     ma_visible: Vec<bool>,
+    ma_windows: Vec<usize>,
     chart_state: ChartState,
     csv_path: Option<PathBuf>,
     agent_receiver: Option<mpsc::Receiver<Result<TradeAgentResult, String>>>,
@@ -83,6 +84,7 @@ impl ChartApp {
             candles: Vec::new(),
             ma_lines: Vec::new(),
             ma_visible: Vec::new(),
+            ma_windows: settings.ma.clone(),
             chart_state: ChartState::new(),
             csv_path: None,
             agent_receiver: None,
@@ -114,7 +116,7 @@ impl ChartApp {
             let had_data = !self.candles.is_empty();
             let had_data_len = self.candles.len();
             let (_, dir) = &self.stocks[idx];
-            let (candles, ma_lines) = load_candles(dir, self.period);
+            let (candles, ma_lines) = load_candles(dir, self.period, &self.ma_windows);
             // Only daily.csv exists on disk — weekly candles are computed
             // in-memory, so trade-agent always gets the daily file.
             self.csv_path = Some(dir.join("daily.csv"));
@@ -380,8 +382,9 @@ impl ChartApp {
     }
 
     fn run_filter(&mut self, ctx: &egui::Context) {
+        let settings = load_settings();
         // Parse filter expressions
-        let filters: Vec<DataFilter> = match load_settings()
+        let filters: Vec<DataFilter> = match settings
             .data_filters
             .iter()
             .map(|s| parse_data_filter(s))
@@ -394,6 +397,7 @@ impl ChartApp {
             }
         };
 
+        let ma_windows = settings.ma.clone();
         let data_dir = self.resolve_data_dir();
         let ctx = ctx.clone();
 
@@ -414,7 +418,7 @@ impl ChartApp {
             let mut matched_secids = Vec::new();
 
             for (i, (info, dir)) in stocks.iter().enumerate() {
-                if evaluate_filters_on_stock(dir, &filters) {
+                if evaluate_filters_on_stock(dir, &filters, &ma_windows) {
                     matched_secids.push(info.secid.clone());
                 }
 

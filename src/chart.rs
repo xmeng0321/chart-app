@@ -89,14 +89,14 @@ impl ChartState {
 /// Return TradingView-style color for a given MA period
 pub fn ma_color(period: usize) -> Color32 {
     match period {
-        5 => Color32::from_rgb(0xFF, 0xEB, 0x3B),   // Yellow
-        10 => Color32::from_rgb(0x29, 0x62, 0xFF),  // Blue
-        20 => Color32::from_rgb(0xFF, 0x98, 0x00),  // Orange
-        30 => Color32::from_rgb(0xE9, 0x1E, 0x63),  // Pink
-        60 => Color32::from_rgb(0xAB, 0x47, 0xBC),  // Purple
-        120 => Color32::from_rgb(0x00, 0xBC, 0xD4), // Cyan
-        250 => Color32::from_rgb(0x4C, 0xAF, 0x50), // Green
-        _ => Color32::from_rgb(0xBB, 0xBB, 0xBB),   // Gray fallback
+        5 => Color32::from_rgb(0xFF, 0xEB, 0x3B),          // Yellow
+        10 => Color32::from_rgb(0x29, 0x62, 0xFF),         // Blue
+        20 => Color32::from_rgb(0xFF, 0x98, 0x00),         // Orange
+        30 => Color32::from_rgb(0xE9, 0x1E, 0x63),         // Pink
+        60 => Color32::from_rgb(0xAB, 0x47, 0xBC),         // Purple
+        120 => Color32::from_rgb(0x00, 0xBC, 0xD4),        // Cyan
+        240 | 250 => Color32::from_rgb(0x4C, 0xAF, 0x50),  // Green
+        _ => Color32::from_rgb(0xBB, 0xBB, 0xBB),          // Gray fallback
     }
 }
 
