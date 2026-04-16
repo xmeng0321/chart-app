@@ -58,6 +58,39 @@ pub fn save_filtered(filtered: &[String]) {
     }
 }
 
+// ── Last-selected stock per tab persistence ──
+//
+// The UI has multiple stock tabs (全部/自选/筛选). When the user switches tabs
+// or reopens the app, we restore the stock they were last viewing on that tab.
+// Keys are tab identifiers ("all", "favorites", "filtered"); values are secids.
+
+pub fn last_selected_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".config")
+        .join("chart-app")
+        .join("last_selected.json")
+}
+
+pub fn load_last_selected() -> HashMap<String, String> {
+    let path = last_selected_path();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        HashMap::new()
+    }
+}
+
+pub fn save_last_selected(last: &HashMap<String, String>) {
+    let path = last_selected_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(last) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 // ── App settings (stock-dl config) ──
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -317,6 +350,7 @@ pub struct Candle {
     pub high: f64,
     pub low: f64,
     pub volume: f64,
+    pub amount: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -434,6 +468,7 @@ fn read_daily_csv(csv_path: &Path) -> Vec<Candle> {
         };
 
         let v = get_f64(&record, "volume", &col_map).unwrap_or(0.0);
+        let amount = get_f64(&record, "amount", &col_map).filter(|value| *value > 0.0);
         candles.push(Candle {
             timestamp: ts,
             open: o,
@@ -441,6 +476,7 @@ fn read_daily_csv(csv_path: &Path) -> Vec<Candle> {
             high: h,
             low: l,
             volume: v,
+            amount,
         });
     }
 
@@ -467,6 +503,10 @@ fn aggregate_weekly(daily: &[Candle]) -> Vec<Candle> {
                 last.low = last.low.min(c.low);
                 last.close = c.close;
                 last.volume += c.volume;
+                last.amount = match (last.amount, c.amount) {
+                    (Some(lhs), Some(rhs)) => Some(lhs + rhs),
+                    _ => None,
+                };
                 last.timestamp = c.timestamp.clone();
             }
             _ => {
@@ -499,7 +539,11 @@ fn parse_ymd(ts: &str) -> Option<(i32, u32, u32)> {
 /// civil-from-days algorithm so we stay dependency-free.
 fn week_key(y: i32, m: u32, d: u32) -> i64 {
     let year = if m <= 2 { y - 1 } else { y };
-    let era = if year >= 0 { year / 400 } else { (year - 399) / 400 };
+    let era = if year >= 0 {
+        year / 400
+    } else {
+        (year - 399) / 400
+    };
     let yoe = (year - era * 400) as i64; // 0..=399
     let mp: i64 = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
     let doy = (153 * mp + 2) / 5 + d as i64 - 1;
@@ -572,7 +616,9 @@ fn parse_filter_operand(s: &str) -> Result<FilterOperand, String> {
     }
 
     let (column, offset) = if let Some(bracket_start) = s.find('[') {
-        let bracket_end = s.find(']').ok_or_else(|| format!("Missing ] in operand: {}", s))?;
+        let bracket_end = s
+            .find(']')
+            .ok_or_else(|| format!("Missing ] in operand: {}", s))?;
         let col = s[..bracket_start].trim();
         let offset_str = s[bracket_start + 1..bracket_end].trim();
         let offset_val: i64 = offset_str
@@ -639,9 +685,9 @@ pub fn evaluate_filters_on_stock(
     }
 
     // Lazily compute chip distribution only when a filter needs it
-    let needs_chip = filters.iter().any(|f| {
-        is_chip_column(&f.left.column) || is_chip_column(&f.right.column)
-    });
+    let needs_chip = filters
+        .iter()
+        .any(|f| is_chip_column(&f.left.column) || is_chip_column(&f.right.column));
 
     let chip_dist = if needs_chip {
         Some(crate::chip::calculate_chip_distribution(
@@ -655,7 +701,8 @@ pub fn evaluate_filters_on_stock(
     // Evaluate each filter
     for filter in filters {
         let left_val = resolve_operand_value(&candles, &ma_lines, &filter.left, chip_dist.as_ref());
-        let right_val = resolve_operand_value(&candles, &ma_lines, &filter.right, chip_dist.as_ref());
+        let right_val =
+            resolve_operand_value(&candles, &ma_lines, &filter.right, chip_dist.as_ref());
 
         let (Some(lv), Some(rv)) = (left_val, right_val) else {
             return false;
@@ -678,10 +725,7 @@ fn is_chip_column(name: &str) -> bool {
     matches!(name, "cbw" | "ckdp" | "cost_center")
 }
 
-fn resolve_chip_value(
-    dist: &crate::chip::ChipDistribution,
-    column: &str,
-) -> Option<f64> {
+fn resolve_chip_value(dist: &crate::chip::ChipDistribution, column: &str) -> Option<f64> {
     match column {
         "cbw" => Some(dist.cbw),
         "ckdp" => Some(dist.ckdp),
@@ -846,12 +890,52 @@ mod tests {
     fn weekly_aggregation_groups_monday_to_sunday() {
         // Days Mon 2025-12-29 through Mon 2026-01-05 span two ISO weeks.
         let daily = vec![
-            Candle { timestamp: "2025-12-29".into(), open: 10.0, close: 11.0, high: 11.5, low: 9.5, volume: 100.0 },
-            Candle { timestamp: "2025-12-30".into(), open: 11.0, close: 12.0, high: 12.5, low: 10.5, volume: 200.0 },
-            Candle { timestamp: "2026-01-02".into(), open: 12.0, close: 13.0, high: 13.5, low: 11.5, volume: 300.0 },
+            Candle {
+                timestamp: "2025-12-29".into(),
+                open: 10.0,
+                close: 11.0,
+                high: 11.5,
+                low: 9.5,
+                volume: 100.0,
+                amount: Some(1_050.0),
+            },
+            Candle {
+                timestamp: "2025-12-30".into(),
+                open: 11.0,
+                close: 12.0,
+                high: 12.5,
+                low: 10.5,
+                volume: 200.0,
+                amount: Some(2_300.0),
+            },
+            Candle {
+                timestamp: "2026-01-02".into(),
+                open: 12.0,
+                close: 13.0,
+                high: 13.5,
+                low: 11.5,
+                volume: 300.0,
+                amount: Some(3_750.0),
+            },
             // Next week (Mon)
-            Candle { timestamp: "2026-01-05".into(), open: 13.0, close: 14.0, high: 14.5, low: 12.5, volume: 400.0 },
-            Candle { timestamp: "2026-01-06".into(), open: 14.0, close: 13.5, high: 14.8, low: 13.0, volume: 500.0 },
+            Candle {
+                timestamp: "2026-01-05".into(),
+                open: 13.0,
+                close: 14.0,
+                high: 14.5,
+                low: 12.5,
+                volume: 400.0,
+                amount: Some(5_420.0),
+            },
+            Candle {
+                timestamp: "2026-01-06".into(),
+                open: 14.0,
+                close: 13.5,
+                high: 14.8,
+                low: 13.0,
+                volume: 500.0,
+                amount: Some(6_900.0),
+            },
         ];
         let weekly = aggregate_weekly(&daily);
         assert_eq!(weekly.len(), 2);
@@ -863,12 +947,14 @@ mod tests {
         assert!((weekly[0].high - 13.5).abs() < 1e-9);
         assert!((weekly[0].low - 9.5).abs() < 1e-9);
         assert!((weekly[0].volume - 600.0).abs() < 1e-9);
+        assert_eq!(weekly[0].amount, Some(7_100.0));
 
         // Week 2
         assert_eq!(weekly[1].timestamp, "2026-01-06");
         assert!((weekly[1].open - 13.0).abs() < 1e-9);
         assert!((weekly[1].close - 13.5).abs() < 1e-9);
         assert!((weekly[1].volume - 900.0).abs() < 1e-9);
+        assert_eq!(weekly[1].amount, Some(12_320.0));
     }
 
     #[test]

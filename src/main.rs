@@ -5,6 +5,7 @@ mod data;
 use chart::{draw_chart, ma_color, AgentStatus, ChartState, SelectionState};
 use data::*;
 use eframe::egui;
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -31,6 +32,15 @@ impl StockTab {
             StockTab::Filtered => "筛选",
         }
     }
+
+    /// Stable key used for persisting the "last selected stock" per tab.
+    fn key(&self) -> &'static str {
+        match self {
+            StockTab::All => "all",
+            StockTab::Favorites => "favorites",
+            StockTab::Filtered => "filtered",
+        }
+    }
 }
 
 struct ChartApp {
@@ -54,6 +64,12 @@ struct ChartApp {
     filtered: Vec<String>,
     filter_status: FilterStatus,
     filter_receiver: Option<mpsc::Receiver<FilterMessage>>,
+    /// Last stock (secid) viewed in each tab. Persisted so a tab switch or
+    /// app restart restores the user's position per-tab.
+    last_selected_by_tab: HashMap<String, String>,
+    /// One-shot flag: if true, the stock list scrolls to reveal the currently
+    /// selected row on the next frame.
+    scroll_to_selected: bool,
 }
 
 impl ChartApp {
@@ -76,6 +92,7 @@ impl ChartApp {
         let stocks = load_stock_list(&data_dir);
         let favorites = load_favorites();
         let filtered = load_filtered();
+        let last_selected_by_tab = load_last_selected();
         let mut app = Self {
             stocks,
             search: String::new(),
@@ -97,18 +114,56 @@ impl ChartApp {
             filtered,
             filter_status: FilterStatus::Idle,
             filter_receiver: None,
+            last_selected_by_tab,
+            scroll_to_selected: false,
         };
 
-        if !app.stocks.is_empty() {
-            app.select_stock(0);
-        }
+        // Restore the stock last viewed on the initial tab (falls back to the
+        // first visible stock if nothing was remembered).
+        app.restore_selection_for_current_tab();
 
         app
     }
 
     fn select_stock(&mut self, idx: usize) {
         self.selected = Some(idx);
+        // Remember per-tab so future tab switches / restarts can restore it.
+        if let Some((info, _)) = self.stocks.get(idx) {
+            self.last_selected_by_tab
+                .insert(self.stock_tab.key().to_string(), info.secid.clone());
+            save_last_selected(&self.last_selected_by_tab);
+        }
         self.reload_candles();
+    }
+
+    /// Select the stock the user was last viewing on the current tab, falling
+    /// back to the first visible entry if there is no remembered stock (or if
+    /// it is no longer in the list). Sets the scroll-to-selected flag so the
+    /// UI scrolls the chosen row into view on the next frame.
+    fn restore_selection_for_current_tab(&mut self) {
+        let visible = self.visible_stock_indices();
+        if visible.is_empty() {
+            self.selected = None;
+            self.candles.clear();
+            self.ma_lines.clear();
+            return;
+        }
+
+        let remembered = self
+            .last_selected_by_tab
+            .get(self.stock_tab.key())
+            .and_then(|secid| {
+                visible
+                    .iter()
+                    .find(|&&i| self.stocks[i].0.secid == *secid)
+                    .copied()
+            });
+        let target = remembered.unwrap_or(visible[0]);
+
+        if self.selected != Some(target) {
+            self.select_stock(target);
+        }
+        self.scroll_to_selected = true;
     }
 
     fn reload_candles(&mut self) {
@@ -581,6 +636,8 @@ impl eframe::App for ChartApp {
                 let next_idx = visible[next_pos];
                 if self.selected != Some(next_idx) {
                     self.select_stock(next_idx);
+                    // Keep the selected row visible as arrow keys page through.
+                    self.scroll_to_selected = true;
                 }
             }
         }
@@ -592,7 +649,7 @@ impl eframe::App for ChartApp {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
 
-                // Tab bar: 全部 | 自选
+                // Tab bar: 全部 | 自选 | 筛选
                 ui.horizontal(|ui| {
                     for tab in [StockTab::All, StockTab::Favorites, StockTab::Filtered] {
                         let active = self.stock_tab == tab;
@@ -602,8 +659,11 @@ impl eframe::App for ChartApp {
                             egui::RichText::new(tab.label())
                                 .color(egui::Color32::from_rgb(0x78, 0x7b, 0x86))
                         };
-                        if ui.selectable_label(active, text).clicked() {
+                        if ui.selectable_label(active, text).clicked() && self.stock_tab != tab {
                             self.stock_tab = tab;
+                            // Jump back to whichever stock the user was last
+                            // viewing on this tab (or the first visible one).
+                            self.restore_selection_for_current_tab();
                         }
                     }
                 });
@@ -755,6 +815,10 @@ impl eframe::App for ChartApp {
                     ui.separator();
                 }
 
+                // One-shot: consume the scroll request here so every row
+                // knows whether it should call `scroll_to_me` on itself.
+                let scroll_to_selected = std::mem::take(&mut self.scroll_to_selected);
+
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                     let search_lower = self.search.to_lowercase();
                     let mut click_idx = None;
@@ -807,8 +871,12 @@ impl eframe::App for ChartApp {
                                 fav_toggle = Some((info.secid.clone(), is_fav));
                             }
                             let label = format!("{} {}", info.secid, info.name);
-                            if ui.selectable_label(selected, &label).clicked() {
+                            let resp = ui.selectable_label(selected, &label);
+                            if resp.clicked() {
                                 click_idx = Some(i);
+                            }
+                            if selected && scroll_to_selected {
+                                resp.scroll_to_me(Some(egui::Align::Center));
                             }
                         });
                     }
@@ -948,6 +1016,12 @@ impl eframe::App for ChartApp {
                 .selected
                 .map(|i| self.stocks[i].0.name.clone())
                 .unwrap_or_default();
+            // Weekly charts span a wider price range per bar, so space the
+            // percentage guide lines further apart to keep the chart readable.
+            let price_level_step = match self.period {
+                Period::Daily => 0.2,
+                Period::Weekly => 0.3,
+            };
             draw_chart(
                 ui,
                 &self.candles,
@@ -955,6 +1029,7 @@ impl eframe::App for ChartApp {
                 &self.ma_visible,
                 &mut self.chart_state,
                 &title,
+                price_level_step,
             );
         });
 

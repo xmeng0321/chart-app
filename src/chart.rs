@@ -100,6 +100,9 @@ pub fn ma_color(period: usize) -> Color32 {
     }
 }
 
+/// `price_level_step` is the fractional gap between consecutive horizontal
+/// price guide lines — e.g. 0.2 for 20 %-per-line on daily charts, 0.3 on
+/// weekly charts.
 pub fn draw_chart(
     ui: &mut Ui,
     candles: &[Candle],
@@ -107,6 +110,7 @@ pub fn draw_chart(
     ma_visible: &[bool],
     state: &mut ChartState,
     title: &str,
+    price_level_step: f64,
 ) {
     if candles.is_empty() {
         ui.centered_and_justified(|ui| {
@@ -176,8 +180,8 @@ pub fn draw_chart(
     // Grid
     draw_grid(&clipped, &chart_rect, state, candles);
 
-    // 10 % price levels anchored to the global lowest low
-    draw_price_levels(&clipped, candles, state, &chart_rect);
+    // Percentage price levels anchored to the global lowest low.
+    draw_price_levels(&clipped, candles, state, &chart_rect, price_level_step);
 
     // Volume (behind candles)
     draw_volume(&clipped, candles, state, &chart_rect);
@@ -1217,11 +1221,18 @@ fn draw_chip_distribution(
 
 // ─── Price Level Lines ────────────────────────────────────────
 
-/// Draw horizontal price level lines at every 20 % above the global lowest low.
-/// The base (0 %) is anchored to `min(low)` across *all* candles so the lines
-/// stay stable as the user scrolls or zooms.
-fn draw_price_levels(painter: &Painter, candles: &[Candle], state: &ChartState, rect: &Rect) {
-    if candles.is_empty() {
+/// Draw horizontal price level lines at every `step` fraction above the
+/// lowest low of the visible range (e.g. 0.2 → every 20 %, 0.3 → every 30 %).
+/// The base (0 %) is anchored to `min(low)` across the visible candles so the
+/// lines stay stable as the user scrolls or zooms.
+fn draw_price_levels(
+    painter: &Painter,
+    candles: &[Candle],
+    state: &ChartState,
+    rect: &Rect,
+    step: f64,
+) {
+    if candles.is_empty() || step <= 0.0 {
         return;
     }
 
@@ -1241,7 +1252,7 @@ fn draw_price_levels(painter: &Painter, candles: &[Candle], state: &ChartState, 
 
     // Skip to the first level that could be visible (at or just below price_min)
     let n_start: usize = if state.price_min > base {
-        ((state.price_min / base - 1.0) / 0.2).floor() as usize
+        ((state.price_min / base - 1.0) / step).floor() as usize
     } else {
         0
     };
@@ -1251,7 +1262,7 @@ fn draw_price_levels(painter: &Painter, candles: &[Candle], state: &ChartState, 
 
     let mut n = n_start;
     loop {
-        let price = base * (1.0 + n as f64 * 0.2);
+        let price = base * (1.0 + n as f64 * step);
 
         // Stop when above the visible price range (with a small margin)
         if price > state.price_max || n > 200 {
@@ -1277,7 +1288,7 @@ fn draw_price_levels(painter: &Painter, candles: &[Candle], state: &ChartState, 
             let label = if n == 0 {
                 "底".to_string()
             } else {
-                format!("+{}%", n * 20)
+                format!("+{}%", (n as f64 * step * 100.0).round() as i64)
             };
             painter.text(
                 pos2(rect.max.x - 6.0, y - 3.0),

@@ -3,6 +3,8 @@ use crate::data::Candle;
 pub const FALLBACK_TURNOVER_RATE: f64 = 0.03;
 const MIN_TURNOVER_RATE: f64 = 0.001;
 const MAX_TURNOVER_RATE: f64 = 0.30;
+const TURNOVER_BASELINE_DAYS: usize = 40;
+const VOLUME_RATIO_EXPONENT: f64 = 0.5;
 const MIN_LOOKBACK: usize = 60;
 const MAX_LOOKBACK: usize = 480;
 const RESIDUAL_MASS_CUTOFF: f64 = 0.03;
@@ -156,12 +158,12 @@ pub fn calculate_chip_distribution(candles: &[Candle], ref_idx: usize) -> ChipDi
     }
 }
 
-/// Estimate a per-day turnover rate from volume. The new data source doesn't
-/// carry a real turnover rate, so we proxy it: scale the fallback rate by the
-/// day's volume relative to the window's median volume, clamped to a sane
-/// range. High-volume days contribute more chips than quiet days.
+/// Estimate a per-day turnover rate from volume. The data source doesn't carry
+/// a real turnover ratio, so we re-anchor each day against a rolling median
+/// volume baseline and use square-root scaling to keep persistent regime
+/// shifts from immediately saturating the turnover cap.
 fn build_effective_turnovers(candles: &[Candle], ref_idx: usize) -> Vec<f64> {
-    let median_volume = median(
+    let overall_median_volume = median(
         candles[..=ref_idx]
             .iter()
             .filter_map(|c| (c.volume > 0.0).then_some(c.volume))
@@ -174,11 +176,25 @@ fn build_effective_turnovers(candles: &[Candle], ref_idx: usize) -> Vec<f64> {
             let c = &candles[i];
             if c.volume <= 0.0 {
                 0.0
-            } else if median_volume > 0.0 {
-                (c.volume / median_volume * FALLBACK_TURNOVER_RATE)
-                    .clamp(MIN_TURNOVER_RATE, MAX_TURNOVER_RATE)
             } else {
-                FALLBACK_TURNOVER_RATE
+                let start = i.saturating_sub(TURNOVER_BASELINE_DAYS.saturating_sub(1));
+                let baseline_volume = median(
+                    candles[start..=i]
+                        .iter()
+                        .filter_map(|c| (c.volume > 0.0).then_some(c.volume))
+                        .collect(),
+                )
+                .filter(|value| *value > 0.0)
+                .unwrap_or(overall_median_volume);
+
+                if baseline_volume > 0.0 {
+                    (c.volume / baseline_volume)
+                        .powf(VOLUME_RATIO_EXPONENT)
+                        .mul_add(FALLBACK_TURNOVER_RATE, 0.0)
+                        .clamp(MIN_TURNOVER_RATE, MAX_TURNOVER_RATE)
+                } else {
+                    FALLBACK_TURNOVER_RATE
+                }
             }
         })
         .collect()
@@ -238,26 +254,46 @@ fn distribute_new_chips(
     let body_high = candle.open.max(candle.close).clamp(day_low, day_high);
     let open = candle.open.clamp(day_low, day_high);
     let close = candle.close.clamp(day_low, day_high);
-    let vwap_proxy = ((day_low + day_high + close * 2.0) / 4.0).clamp(day_low, day_high);
+    let amount_anchor = infer_average_trade_price(candle, day_low, day_high);
+    let price_anchor = amount_anchor
+        .unwrap_or_else(|| ((day_low + day_high + close * 2.0) / 4.0).clamp(day_low, day_high));
     let directional_bias = ((close - open) / range).abs().clamp(0.0, 1.0);
     let body_fade = (range * 0.25).max(bin_width);
     let open_span = (range * 0.45).max(bin_width);
     let close_span = (range * 0.30).max(bin_width);
-    let vwap_span = (range * 0.22).max(bin_width);
+    let price_anchor_span = if amount_anchor.is_some() {
+        (range * 0.16).max(bin_width)
+    } else {
+        (range * 0.22).max(bin_width)
+    };
     let wick_focus = if close >= open { body_low } else { body_high };
     let wick_span = (range * 0.20).max(bin_width);
+    let baseline_weight = if amount_anchor.is_some() { 0.04 } else { 0.06 };
+    let open_weight = if amount_anchor.is_some() {
+        0.10 - 0.03 * directional_bias
+    } else {
+        0.12 - 0.04 * directional_bias
+    };
+    let close_weight = if amount_anchor.is_some() {
+        0.18 + 0.08 * directional_bias
+    } else {
+        0.24 + 0.12 * directional_bias
+    };
+    let price_anchor_weight = if amount_anchor.is_some() { 0.34 } else { 0.22 };
+    let body_region_weight = if amount_anchor.is_some() { 0.24 } else { 0.26 };
+    let wick_weight = if amount_anchor.is_some() { 0.08 } else { 0.10 };
 
     let mut weights = Vec::with_capacity(hi_bin.saturating_sub(lo_bin) + 1);
     let mut weight_sum = 0.0;
 
     for b in lo_bin..=hi_bin {
         let bin_price = price_min + (b as f64 + 0.5) * bin_width;
-        let w = 0.06
-            + (0.12 - 0.04 * directional_bias) * triangular_weight(bin_price, open, open_span)
-            + (0.24 + 0.12 * directional_bias) * triangular_weight(bin_price, close, close_span)
-            + 0.22 * triangular_weight(bin_price, vwap_proxy, vwap_span)
-            + 0.26 * body_weight(bin_price, body_low, body_high, body_fade)
-            + 0.10 * triangular_weight(bin_price, wick_focus, wick_span);
+        let w = baseline_weight
+            + open_weight * triangular_weight(bin_price, open, open_span)
+            + close_weight * triangular_weight(bin_price, close, close_span)
+            + price_anchor_weight * triangular_weight(bin_price, price_anchor, price_anchor_span)
+            + body_region_weight * body_weight(bin_price, body_low, body_high, body_fade)
+            + wick_weight * triangular_weight(bin_price, wick_focus, wick_span);
         weights.push(w);
         weight_sum += w;
     }
@@ -349,11 +385,43 @@ fn median(mut values: Vec<f64>) -> Option<f64> {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mid = values.len() / 2;
 
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         Some((values[mid - 1] + values[mid]) / 2.0)
     } else {
         Some(values[mid])
     }
+}
+
+fn infer_average_trade_price(candle: &Candle, day_low: f64, day_high: f64) -> Option<f64> {
+    let amount = candle.amount?;
+    if amount <= 0.0 || candle.volume <= 0.0 {
+        return None;
+    }
+
+    let typical_price = ((candle.open + candle.close + day_low + day_high) / 4.0)
+        .abs()
+        .max(1e-6);
+    let tolerance = ((day_high - day_low) * 0.05).max(typical_price * 0.01);
+
+    [1.0, 10.0, 100.0, 1000.0, 10000.0]
+        .into_iter()
+        .filter_map(|scale| {
+            let avg_price = amount / candle.volume / scale;
+            if !avg_price.is_finite() || avg_price <= 0.0 {
+                return None;
+            }
+
+            if avg_price < day_low - tolerance || avg_price > day_high + tolerance {
+                return None;
+            }
+
+            Some((
+                ((avg_price / typical_price).ln()).abs(),
+                avg_price.clamp(day_low, day_high),
+            ))
+        })
+        .min_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0))
+        .map(|(_, avg_price)| avg_price)
 }
 
 fn price_to_bin(price: f64, price_min: f64, bin_width: f64, num_bins: usize) -> usize {
@@ -370,6 +438,17 @@ mod tests {
     use crate::data::Candle;
 
     fn candle(open: f64, close: f64, high: f64, low: f64, volume: f64) -> Candle {
+        candle_with_amount(open, close, high, low, volume, None)
+    }
+
+    fn candle_with_amount(
+        open: f64,
+        close: f64,
+        high: f64,
+        low: f64,
+        volume: f64,
+        amount: Option<f64>,
+    ) -> Candle {
         Candle {
             timestamp: "2026-01-01".to_string(),
             open,
@@ -377,6 +456,7 @@ mod tests {
             high,
             low,
             volume,
+            amount,
         }
     }
 
@@ -408,9 +488,8 @@ mod tests {
 
     #[test]
     fn high_volume_day_raises_turnover_estimate() {
-        // Right-skewed volumes: the median is 100, but one outlier is 10x,
-        // so the mean-based average turnover should be well above the
-        // fallback baseline.
+        // A one-off spike should still raise the inferred turnover above the
+        // fallback baseline even without true float-share data.
         let candles = vec![
             candle(10.0, 11.0, 11.0, 10.0, 100.0),
             candle(11.0, 12.0, 12.0, 11.0, 100.0),
@@ -461,6 +540,40 @@ mod tests {
             .unwrap();
 
         assert!(close_bin.chips > open_bin.chips);
+    }
+
+    #[test]
+    fn sustained_volume_regime_shift_reanchors_turnover_baseline() {
+        let mut candles = (0..120)
+            .map(|_| candle(10.0, 10.5, 10.8, 9.8, 100.0))
+            .collect::<Vec<_>>();
+        candles.extend((0..80).map(|_| candle(10.0, 10.5, 10.8, 9.8, 1000.0)));
+
+        let dist = calculate_chip_distribution(&candles, candles.len() - 1);
+
+        assert!(dist.avg_turnover_rate < FALLBACK_TURNOVER_RATE * 1.5);
+    }
+
+    #[test]
+    fn amount_anchor_moves_cost_center_toward_average_trade_price() {
+        let baseline = calculate_chip_distribution(&[candle(10.0, 14.0, 15.0, 9.0, 100.0)], 0);
+        let anchored = calculate_chip_distribution(
+            &[candle_with_amount(
+                10.0,
+                14.0,
+                15.0,
+                9.0,
+                100.0,
+                Some(102_000.0),
+            )],
+            0,
+        );
+        let target_avg_price = 10.2;
+
+        assert!(
+            (anchored.cost_center - target_avg_price).abs()
+                < (baseline.cost_center - target_avg_price).abs()
+        );
     }
 
     #[test]
