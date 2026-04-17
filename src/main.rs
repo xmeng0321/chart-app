@@ -5,7 +5,7 @@ mod data;
 use chart::{draw_chart, ma_color, AgentStatus, ChartState, SelectionState};
 use data::*;
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -70,6 +70,14 @@ struct ChartApp {
     /// One-shot flag: if true, the stock list scrolls to reveal the currently
     /// selected row on the next frame.
     scroll_to_selected: bool,
+    /// Secid whose per-stock auto-sync (`stock-dl --codes <code>`) is currently
+    /// running in the background. `None` means no auto-sync in flight.
+    auto_sync_secid: Option<String>,
+    auto_sync_receiver: Option<mpsc::Receiver<(String, Result<(), String>)>>,
+    /// Secids we've already attempted to auto-sync this session. We fire at
+    /// most once per stock per run so arrow-keying through the list doesn't
+    /// spawn a stock-dl process for every row.
+    auto_synced: HashSet<String>,
 }
 
 impl ChartApp {
@@ -116,6 +124,9 @@ impl ChartApp {
             filter_receiver: None,
             last_selected_by_tab,
             scroll_to_selected: false,
+            auto_sync_secid: None,
+            auto_sync_receiver: None,
+            auto_synced: HashSet::new(),
         };
 
         // Restore the stock last viewed on the initial tab (falls back to the
@@ -425,6 +436,70 @@ impl ChartApp {
         });
     }
 
+    /// Fire a background `stock-dl --codes <code>` for the currently selected
+    /// stock if we haven't already tried it this session. No-ops when a batch
+    /// sync is in progress, another auto-sync is in flight, nothing is
+    /// selected, or this stock has already been attempted.
+    fn try_start_auto_sync(&mut self, ctx: &egui::Context) {
+        if matches!(self.sync_status, SyncStatus::Running { .. }) {
+            return;
+        }
+        if self.auto_sync_receiver.is_some() {
+            return;
+        }
+        let Some(idx) = self.selected else { return };
+        let secid = self.stocks[idx].0.secid.clone();
+        if !self.auto_synced.insert(secid.clone()) {
+            return;
+        }
+
+        self.auto_sync_secid = Some(secid.clone());
+
+        let settings = load_settings();
+        let code = strip_secid_prefix(&secid).to_string();
+        let ctx = ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        self.auto_sync_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            let data_dir = if settings.dl.data_dir.starts_with("~/") {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                format!("{}/{}", home, &settings.dl.data_dir[2..])
+            } else {
+                settings.dl.data_dir.clone()
+            };
+
+            let mut cmd = std::process::Command::new(&settings.dl.binary);
+            cmd.arg("-o").arg(&data_dir);
+            cmd.arg("download");
+            cmd.arg("--codes").arg(&code);
+
+            eprintln!("[auto-sync] {} -> {:?}", secid, cmd);
+
+            let msg = match cmd.output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stdout.is_empty() {
+                        eprintln!("[auto-sync] stdout:\n{}", stdout);
+                    }
+                    if !stderr.is_empty() {
+                        eprintln!("[auto-sync] stderr:\n{}", stderr);
+                    }
+                    if output.status.success() {
+                        Ok(())
+                    } else {
+                        Err(stderr.trim().to_string())
+                    }
+                }
+                Err(e) => Err(format!("failed to run {}: {}", settings.dl.binary, e)),
+            };
+
+            let _ = tx.send((secid, msg));
+            ctx.request_repaint();
+        });
+    }
+
     fn resolve_data_dir(&self) -> PathBuf {
         let settings = load_settings();
         let dir = &settings.dl.data_dir;
@@ -613,6 +688,30 @@ impl eframe::App for ChartApp {
         if filter_done {
             self.filter_receiver = None;
         }
+
+        // Poll single-stock auto-sync
+        if let Some(ref rx) = self.auto_sync_receiver {
+            if let Ok((secid, result)) = rx.try_recv() {
+                if let Err(e) = &result {
+                    eprintln!("[auto-sync] {} failed: {}", secid, e);
+                }
+                self.auto_sync_secid = None;
+                self.auto_sync_receiver = None;
+                // Pull in fresh candles only if the user is still looking at
+                // the stock we just synced.
+                if result.is_ok() {
+                    if let Some(idx) = self.selected {
+                        if self.stocks[idx].0.secid == secid {
+                            self.reload_candles();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Kick off an auto-sync for whichever stock is currently on screen
+        // (one-shot per secid per session).
+        self.try_start_auto_sync(ctx);
 
         // ── Up/Down arrow key to navigate stocks ──
         let arrow = ctx.input(|i| {
@@ -909,6 +1008,14 @@ impl eframe::App for ChartApp {
                             .size(15.0)
                             .strong(),
                     );
+                    if self.auto_sync_secid.as_deref() == Some(info.secid.as_str()) {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("同步中")
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(0x90, 0xCA, 0xF9)),
+                        );
+                    }
                 }
                 ui.separator();
 
