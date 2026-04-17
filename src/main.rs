@@ -102,7 +102,7 @@ impl ChartApp {
             ma_lines: Vec::new(),
             ma_visible: Vec::new(),
             ma_windows: settings.ma.clone(),
-            chart_state: ChartState::new(),
+            chart_state: ChartState::new(settings.chip.clone()),
             csv_path: None,
             agent_receiver: None,
             model: "auto".to_string(),
@@ -453,6 +453,7 @@ impl ChartApp {
         };
 
         let ma_windows = settings.ma.clone();
+        let chip_settings = settings.chip.clone();
         let data_dir = self.resolve_data_dir();
         let ctx = ctx.clone();
 
@@ -473,7 +474,7 @@ impl ChartApp {
             let mut matched_secids = Vec::new();
 
             for (i, (info, dir)) in stocks.iter().enumerate() {
-                if evaluate_filters_on_stock(dir, &filters, &ma_windows) {
+                if evaluate_filters_on_stock(dir, &filters, &ma_windows, &chip_settings) {
                     matched_secids.push(info.secid.clone());
                 }
 

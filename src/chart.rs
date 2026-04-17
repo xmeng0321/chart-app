@@ -1,5 +1,5 @@
 use crate::chip::{calculate_chip_distribution, ChipCache};
-use crate::data::{Candle, MaLine, TradeAgentResult};
+use crate::data::{Candle, ChipSettings, MaLine, TradeAgentResult};
 use eframe::egui::*;
 
 // TradingView dark theme colors
@@ -53,10 +53,11 @@ pub struct ChartState {
     pub selection_just_completed: bool,
     pub show_chip_distribution: bool,
     pub chip_cache: Option<ChipCache>,
+    pub chip_settings: ChipSettings,
 }
 
 impl ChartState {
-    pub fn new() -> Self {
+    pub fn new(chip_settings: ChipSettings) -> Self {
         Self {
             offset: 0.0,
             candles_in_view: 120.0,
@@ -69,6 +70,7 @@ impl ChartState {
             selection_just_completed: false,
             show_chip_distribution: false,
             chip_cache: None,
+            chip_settings,
         }
     }
 
@@ -1110,7 +1112,7 @@ fn draw_chip_distribution(
     };
 
     if needs_recalc {
-        let dist = calculate_chip_distribution(candles, ref_idx);
+        let dist = calculate_chip_distribution(candles, ref_idx, &state.chip_settings);
         state.chip_cache = Some(ChipCache { ref_idx, dist });
     }
 
@@ -1166,37 +1168,58 @@ fn draw_chip_distribution(
         clipped.rect_filled(bar_rect, 0.0, color);
     }
 
-    // Cost center line + CBW label
+    // Cost center dashed line + 重心 label that travels with it.
     if dist.cost_center > 0.0 {
         let cc_y = price_to_y(dist.cost_center, state, rect);
         if cc_y >= rect.min.y && cc_y <= rect.max.y {
             let cc_color = Color32::from_rgb(0xFF, 0xD7, 0x00); // gold
             draw_dashed_line_h(&clipped, rect.min.x, rect.max.x, cc_y, cc_color, 1.0);
             clipped.text(
-                pos2(rect.min.x + 4.0, cc_y - 12.0),
+                pos2(rect.min.x + 4.0, cc_y - 2.0),
                 Align2::LEFT_BOTTOM,
                 format!("重心 {:.2}", dist.cost_center),
-                FontId::proportional(9.5),
-                cc_color,
-            );
-            clipped.text(
-                pos2(rect.min.x + 4.0, cc_y + 2.0),
-                Align2::LEFT_TOP,
-                format!("CBW {:.1}%  CKDP {:.1}", dist.cbw, dist.ckdp),
                 FontId::proportional(9.5),
                 cc_color,
             );
         }
     }
 
+    // Indicator stack — one metric per line, right-aligned to the chip
+    // column's right edge. Order top-down: ASR / CBW / CKDP.
+    let indicator_color = Color32::from_rgb(0xFF, 0xD7, 0x00);
+    let indicator_font = FontId::proportional(10.0);
+    let line_h = 13.0;
+    let top_pad = 4.0;
+    let right_pad = 4.0;
+    let indicator_lines = [
+        format!("ASR {:.0}%", dist.profit_ratio * 100.0),
+        format!("CBW {:.1}%", dist.cbw),
+        format!("CKDP {:.1}", dist.ckdp),
+    ];
+    for (i, text) in indicator_lines.iter().enumerate() {
+        painter.text(
+            pos2(
+                rect.max.x - right_pad,
+                rect.min.y + top_pad + i as f32 * line_h,
+            ),
+            Align2::RIGHT_TOP,
+            text,
+            indicator_font.clone(),
+            indicator_color,
+        );
+    }
+
+    // Average turnover note, pushed below the indicator stack so they don't
+    // overlap.
     if dist.avg_turnover_rate > 0.0 {
+        let stack_height = top_pad + indicator_lines.len() as f32 * line_h + 4.0;
         let note = format!(
             "按成交量估算换手\n平均{:.1}%",
             dist.avg_turnover_rate * 100.0
         );
         let note_rect = Rect::from_min_size(
-            pos2(rect.min.x + 6.0, rect.min.y + 6.0),
-            vec2((rect.width() - 12.0).max(0.0), 34.0),
+            pos2(rect.min.x + 6.0, rect.min.y + stack_height),
+            vec2((rect.width() - 12.0).max(0.0), 32.0),
         );
         painter.rect_filled(
             note_rect,
