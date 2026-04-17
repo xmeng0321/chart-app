@@ -118,6 +118,116 @@ pub struct AppSettings {
     pub dl: DlSettings,
     pub data_filters: Vec<String>,
     pub ma: Vec<usize>,
+    pub chip: ChipSettings,
+}
+
+/// Tunable parameters for the chip (筹码) distribution model. All fields fall
+/// back to sensible defaults so an existing settings.json without a `chip`
+/// section keeps working.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ChipSettings {
+    /// Per-day turnover used when no volume baseline is available.
+    #[serde(default = "default_fallback_turnover_rate")]
+    pub fallback_turnover_rate: f64,
+    /// Lower clamp on per-day turnover so very thin sessions still decay chips.
+    #[serde(default = "default_min_turnover_rate")]
+    pub min_turnover_rate: f64,
+    /// Upper clamp so a single huge volume bar can't wipe the historical chip
+    /// memory in one day.
+    #[serde(default = "default_max_turnover_rate")]
+    pub max_turnover_rate: f64,
+    /// Trailing-window length used to derive the local volume baseline.
+    #[serde(default = "default_turnover_baseline_days")]
+    pub turnover_baseline_days: usize,
+    /// Exponent applied to the (volume / baseline) ratio. < 1 dampens spikes.
+    #[serde(default = "default_volume_ratio_exponent")]
+    pub volume_ratio_exponent: f64,
+    /// Minimum trading days the lookback should cover before exiting early.
+    #[serde(default = "default_min_lookback")]
+    pub min_lookback: usize,
+    /// Hard cap on lookback length.
+    #[serde(default = "default_max_lookback")]
+    pub max_lookback: usize,
+    /// Once residual chip mass falls below this, older days are dropped.
+    #[serde(default = "default_residual_mass_cutoff")]
+    pub residual_mass_cutoff: f64,
+    /// Lower clamp on bin count.
+    #[serde(default = "default_min_bins")]
+    pub min_bins: usize,
+    /// Upper clamp on bin count.
+    #[serde(default = "default_max_bins")]
+    pub max_bins: usize,
+    /// Lower mass quantile used to pick `cost_low` (e.g. 0.05 = 5%).
+    #[serde(default = "default_cost_quantile_low")]
+    pub cost_quantile_low: f64,
+    /// Upper mass quantile used to pick `cost_high` (e.g. 0.95 = 95%).
+    #[serde(default = "default_cost_quantile_high")]
+    pub cost_quantile_high: f64,
+    /// Multiplier on the price-anchor weight inside `distribute_new_chips`.
+    /// 1.0 keeps original behaviour; > 1 trusts the amount-derived avg price
+    /// more.
+    #[serde(default = "default_anchor_strength")]
+    pub anchor_strength: f64,
+}
+
+fn default_fallback_turnover_rate() -> f64 {
+    0.03
+}
+fn default_min_turnover_rate() -> f64 {
+    0.001
+}
+fn default_max_turnover_rate() -> f64 {
+    0.30
+}
+fn default_turnover_baseline_days() -> usize {
+    40
+}
+fn default_volume_ratio_exponent() -> f64 {
+    0.5
+}
+fn default_min_lookback() -> usize {
+    60
+}
+fn default_max_lookback() -> usize {
+    480
+}
+fn default_residual_mass_cutoff() -> f64 {
+    0.03
+}
+fn default_min_bins() -> usize {
+    96
+}
+fn default_max_bins() -> usize {
+    240
+}
+fn default_cost_quantile_low() -> f64 {
+    0.05
+}
+fn default_cost_quantile_high() -> f64 {
+    0.95
+}
+fn default_anchor_strength() -> f64 {
+    1.0
+}
+
+impl Default for ChipSettings {
+    fn default() -> Self {
+        Self {
+            fallback_turnover_rate: default_fallback_turnover_rate(),
+            min_turnover_rate: default_min_turnover_rate(),
+            max_turnover_rate: default_max_turnover_rate(),
+            turnover_baseline_days: default_turnover_baseline_days(),
+            volume_ratio_exponent: default_volume_ratio_exponent(),
+            min_lookback: default_min_lookback(),
+            max_lookback: default_max_lookback(),
+            residual_mass_cutoff: default_residual_mass_cutoff(),
+            min_bins: default_min_bins(),
+            max_bins: default_max_bins(),
+            cost_quantile_low: default_cost_quantile_low(),
+            cost_quantile_high: default_cost_quantile_high(),
+            anchor_strength: default_anchor_strength(),
+        }
+    }
 }
 
 fn default_data_dir() -> String {
@@ -145,6 +255,7 @@ impl Default for AppSettings {
             dl: DlSettings::default(),
             data_filters: default_data_filters(),
             ma: default_ma(),
+            chip: ChipSettings::default(),
         }
     }
 }
@@ -166,6 +277,8 @@ struct LegacyAppSettings {
     // Legacy top-level alias for `ma`.
     #[serde(default)]
     ma_windows: Option<Vec<usize>>,
+    #[serde(default)]
+    chip: ChipSettings,
 }
 
 /// Mirrors `DlSettings` but also tolerates the legacy `ma_windows` key so we
@@ -221,6 +334,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             dl,
             data_filters: legacy.data_filters,
             ma,
+            chip: legacy.chip,
         })
     }
 }
@@ -646,6 +760,7 @@ pub fn evaluate_filters_on_stock(
     stock_dir: &Path,
     filters: &[DataFilter],
     ma_windows: &[usize],
+    chip_settings: &ChipSettings,
 ) -> bool {
     if filters.is_empty() {
         return true;
@@ -693,6 +808,7 @@ pub fn evaluate_filters_on_stock(
         Some(crate::chip::calculate_chip_distribution(
             &candles,
             candles.len() - 1,
+            chip_settings,
         ))
     } else {
         None
@@ -722,7 +838,7 @@ pub fn evaluate_filters_on_stock(
 }
 
 fn is_chip_column(name: &str) -> bool {
-    matches!(name, "cbw" | "ckdp" | "cost_center")
+    matches!(name, "cbw" | "ckdp" | "cost_center" | "asr" | "winner")
 }
 
 fn resolve_chip_value(dist: &crate::chip::ChipDistribution, column: &str) -> Option<f64> {
@@ -730,6 +846,10 @@ fn resolve_chip_value(dist: &crate::chip::ChipDistribution, column: &str) -> Opt
         "cbw" => Some(dist.cbw),
         "ckdp" => Some(dist.ckdp),
         "cost_center" => Some(dist.cost_center),
+        // 获利盘比例 (Active Stock Ratio / WINNER 函数)。CBW/CKDP 都以百分比
+        // 出现，所以 asr 也乘以 100 保持一致——`asr > 50` 比 `asr > 0.5`
+        // 在表达式里更自然。`winner` 作为同义别名兼容通达信公式习惯。
+        "asr" | "winner" => Some(dist.profit_ratio * 100.0),
         _ => None,
     }
 }
@@ -870,6 +990,42 @@ mod tests {
     }
 
     #[test]
+    fn missing_chip_section_falls_back_to_defaults() {
+        // Existing settings.json files won't have a `chip` key — they must
+        // still parse and surface ChipSettings::default().
+        let json = r#"{
+          "dl": { "data_dir": "/d", "binary": "stock-dl" }
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.chip, ChipSettings::default());
+    }
+
+    #[test]
+    fn chip_section_overrides_only_specified_fields() {
+        // Partial chip overrides should replace the listed fields and leave
+        // the rest at their defaults.
+        let json = r#"{
+          "dl": { "data_dir": "/d", "binary": "stock-dl" },
+          "chip": {
+            "max_lookback": 240,
+            "cost_quantile_low": 0.10,
+            "cost_quantile_high": 0.90,
+            "anchor_strength": 1.5
+          }
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.chip.max_lookback, 240);
+        assert!((parsed.chip.cost_quantile_low - 0.10).abs() < 1e-9);
+        assert!((parsed.chip.cost_quantile_high - 0.90).abs() < 1e-9);
+        assert!((parsed.chip.anchor_strength - 1.5).abs() < 1e-9);
+        // Untouched fields keep defaults.
+        let d = ChipSettings::default();
+        assert_eq!(parsed.chip.min_lookback, d.min_lookback);
+        assert_eq!(parsed.chip.min_bins, d.min_bins);
+        assert!((parsed.chip.fallback_turnover_rate - d.fallback_turnover_rate).abs() < 1e-9);
+    }
+
+    #[test]
     fn parses_legacy_settings_with_dropped_fields_ignored() {
         // Older settings files may still have source/periods/include_st. These
         // must not cause a parse failure.
@@ -999,11 +1155,52 @@ mod tests {
 
         // price > ma10 should hold on a rising series
         let filters = vec![parse_data_filter("price > ma10").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &filters, &ma));
+        assert!(evaluate_filters_on_stock(&dir, &filters, &ma, &ChipSettings::default()));
 
         // price < ma10 should not hold
         let filters = vec![parse_data_filter("price < ma10").unwrap()];
-        assert!(!evaluate_filters_on_stock(&dir, &filters, &ma));
+        assert!(!evaluate_filters_on_stock(&dir, &filters, &ma, &ChipSettings::default()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_resolves_asr_chip_column() {
+        // Build a contrived series where the latest close sits near the top of
+        // the historical price range → most chips below it → ASR should be
+        // high. Then assert the filter `asr > 50` matches and `winner > 50`
+        // (alias) matches the same way.
+        let dir = std::env::temp_dir().join("chart_app_filter_asr");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 80 rows with steadily rising closes from 10 → ~17.9, so the final
+        // close is near the top of accumulated chip mass.
+        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
+        for i in 0..80 {
+            let p = 10.0 + i as f64 * 0.1;
+            csv.push_str(&format!(
+                "2026-01-{:02},{p},{p},{ph},{pl},100,\n",
+                (i % 28) + 1,
+                p = p,
+                ph = p + 0.1,
+                pl = p - 0.1,
+            ));
+        }
+        std::fs::write(dir.join("daily.csv"), csv).unwrap();
+
+        let ma = vec![10, 30, 60];
+        let chip = ChipSettings::default();
+
+        let asr_filter = vec![parse_data_filter("asr > 50").unwrap()];
+        assert!(evaluate_filters_on_stock(&dir, &asr_filter, &ma, &chip));
+
+        let winner_filter = vec![parse_data_filter("winner > 50").unwrap()];
+        assert!(evaluate_filters_on_stock(&dir, &winner_filter, &ma, &chip));
+
+        // Sanity: asr > 200 can never hold (capped at 100).
+        let impossible = vec![parse_data_filter("asr > 200").unwrap()];
+        assert!(!evaluate_filters_on_stock(&dir, &impossible, &ma, &chip));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1029,7 +1226,12 @@ mod tests {
 
         let configured = vec![10, 30, 60];
         let filters = vec![parse_data_filter("price > ma5").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &filters, &configured));
+        assert!(evaluate_filters_on_stock(
+            &dir,
+            &filters,
+            &configured,
+            &ChipSettings::default()
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
