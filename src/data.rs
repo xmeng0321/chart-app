@@ -542,7 +542,9 @@ pub struct MaClusterScore {
 /// `idx`. Returns `None` when fewer than two MAs have a valid value at that
 /// position (need at least one pair to score anything).
 ///
-/// A pair `(short_ma, long_ma)` counts as bullish iff all three hold:
+/// Only *adjacent* pairs in period-sorted order are evaluated (e.g. 5 vs 10,
+/// 10 vs 20, 20 vs 60), not every cross combination. A pair
+/// `(short_ma, long_ma)` counts as bullish iff all three hold:
 /// 1. `short_ma[idx] > long_ma[idx]` (correct order),
 /// 2. `short_ma` is rising over `slope_lookback` bars, and
 /// 3. `long_ma` is rising over `slope_lookback` bars.
@@ -588,14 +590,14 @@ pub fn calculate_ma_cluster_score(
     let amp_pct = (max - min) / min * 100.0;
 
     // Bull alignment: shorter period above longer period AND both MAs rising.
+    // Only adjacent pairs in period-sorted order are scored (5↔10, 10↔20, …),
+    // so bull is the fraction of consecutive MAs that are properly stacked.
     let n = values.len();
-    let total_pairs = n * (n - 1) / 2;
+    let total_pairs = n - 1;
     let mut correct = 0usize;
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if values[i] > values[j] && rising[i] && rising[j] {
-                correct += 1;
-            }
+    for i in 0..total_pairs {
+        if values[i] > values[i + 1] && rising[i] && rising[i + 1] {
+            correct += 1;
         }
     }
     let bull = correct as f64 / total_pairs as f64;
@@ -931,12 +933,40 @@ pub fn evaluate_filters_on_stock(
         }
     }
 
-    let (candles, ma_lines) = load_candles(stock_dir, Period::Daily, &windows);
+    // A stock qualifies if its conditions are satisfied on either the daily
+    // or the weekly timeframe — weekly captures slower setups that the daily
+    // view alone would miss.
+    for period in [Period::Daily, Period::Weekly] {
+        if evaluate_filters_for_period(
+            stock_dir,
+            filters,
+            ma_windows,
+            &windows,
+            chip_settings,
+            ma_cluster_settings,
+            period,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn evaluate_filters_for_period(
+    stock_dir: &Path,
+    filters: &[DataFilter],
+    ma_windows: &[usize],
+    windows: &[usize],
+    chip_settings: &ChipSettings,
+    ma_cluster_settings: &MaClusterSettings,
+    period: Period,
+) -> bool {
+    let (candles, ma_lines) = load_candles(stock_dir, period, windows);
     if candles.is_empty() {
         return false;
     }
 
-    // Determine how many trailing rows we need
     let max_offset = filters
         .iter()
         .flat_map(|f| [f.left.offset, f.right.offset])
@@ -946,7 +976,6 @@ pub fn evaluate_filters_on_stock(
         return false;
     }
 
-    // Lazily compute chip distribution only when a filter needs it
     let needs_chip = filters
         .iter()
         .any(|f| is_chip_column(&f.left.column) || is_chip_column(&f.right.column));
@@ -978,7 +1007,6 @@ pub fn evaluate_filters_on_stock(
         ma_cluster_settings,
     };
 
-    // Evaluate each filter
     for filter in filters {
         let left_val = resolve_operand_value(&ctx, &filter.left);
         let right_val = resolve_operand_value(&ctx, &filter.right);
