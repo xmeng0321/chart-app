@@ -64,6 +64,9 @@ struct ChartApp {
     filtered: Vec<String>,
     filter_status: FilterStatus,
     filter_receiver: Option<mpsc::Receiver<FilterMessage>>,
+    /// Name of the currently picked filter bundle from `settings.data_filters`.
+    /// Persisted across launches so the dropdown reopens to the same choice.
+    selected_filter_name: Option<String>,
     /// Last stock (secid) viewed in each tab. Persisted so a tab switch or
     /// app restart restores the user's position per-tab.
     last_selected_by_tab: HashMap<String, String>,
@@ -101,6 +104,12 @@ impl ChartApp {
         let favorites = load_favorites();
         let filtered = load_filtered();
         let last_selected_by_tab = load_last_selected();
+        // Restore the previously chosen filter name, falling back to the first
+        // available bundle so the dropdown always has a valid selection when
+        // any filters are configured.
+        let selected_filter_name = load_selected_filter()
+            .filter(|n| settings.data_filters.iter().any(|f| &f.name == n))
+            .or_else(|| settings.data_filters.first().map(|f| f.name.clone()));
         let mut app = Self {
             stocks,
             search: String::new(),
@@ -122,6 +131,7 @@ impl ChartApp {
             filtered,
             filter_status: FilterStatus::Idle,
             filter_receiver: None,
+            selected_filter_name,
             last_selected_by_tab,
             scroll_to_selected: false,
             auto_sync_secid: None,
@@ -513,9 +523,25 @@ impl ChartApp {
 
     fn run_filter(&mut self, ctx: &egui::Context) {
         let settings = load_settings();
-        // Parse filter expressions
-        let filters: Vec<DataFilter> = match settings
-            .data_filters
+
+        // Resolve which named filter bundle to run. Falls back to the first
+        // entry if the persisted selection no longer exists.
+        let bundle = match self
+            .selected_filter_name
+            .as_ref()
+            .and_then(|n| settings.data_filters.iter().find(|f| &f.name == n))
+            .or_else(|| settings.data_filters.first())
+        {
+            Some(b) => b,
+            None => {
+                self.filter_status =
+                    FilterStatus::Error("未配置任何筛选 (settings.json: data_filters)".to_string());
+                return;
+            }
+        };
+
+        let filters: Vec<DataFilter> = match bundle
+            .filters
             .iter()
             .map(|s| parse_data_filter(s))
             .collect::<Result<Vec<_>, _>>()
@@ -858,6 +884,55 @@ impl eframe::App for ChartApp {
                 if self.stock_tab == StockTab::Filtered {
                     let is_filtering =
                         matches!(self.filter_status, FilterStatus::Running { .. });
+
+                    // Filter-bundle picker. Reads names from settings on every
+                    // frame so edits to settings.json are reflected without a
+                    // restart.
+                    let available_filters: Vec<String> = load_settings()
+                        .data_filters
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect();
+                    if !available_filters.is_empty() {
+                        // Repair stale selection (e.g. user removed the active
+                        // bundle from settings).
+                        if !self
+                            .selected_filter_name
+                            .as_ref()
+                            .map(|n| available_filters.contains(n))
+                            .unwrap_or(false)
+                        {
+                            self.selected_filter_name = Some(available_filters[0].clone());
+                            if let Some(name) = &self.selected_filter_name {
+                                save_selected_filter(name);
+                            }
+                        }
+                        let prev_filter = self.selected_filter_name.clone();
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("筛选:").size(12.0));
+                            let current = self
+                                .selected_filter_name
+                                .clone()
+                                .unwrap_or_else(|| available_filters[0].clone());
+                            egui::ComboBox::from_id_salt("filter-bundle-select")
+                                .selected_text(egui::RichText::new(&current).size(12.0))
+                                .show_ui(ui, |ui| {
+                                    for name in &available_filters {
+                                        ui.selectable_value(
+                                            &mut self.selected_filter_name,
+                                            Some(name.clone()),
+                                            name.as_str(),
+                                        );
+                                    }
+                                });
+                        });
+                        if self.selected_filter_name != prev_filter {
+                            if let Some(name) = &self.selected_filter_name {
+                                save_selected_filter(name);
+                            }
+                        }
+                    }
+
                     ui.horizontal(|ui| {
                         let btn_text = if is_filtering {
                             "筛选中..."

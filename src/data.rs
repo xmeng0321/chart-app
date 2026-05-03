@@ -91,6 +91,35 @@ pub fn save_last_selected(last: &HashMap<String, String>) {
     }
 }
 
+// ── Selected filter persistence ──
+//
+// Remembers which named filter (from `settings.data_filters[].name`) the user
+// last picked in the Filtered tab dropdown so it can be restored next launch.
+
+pub fn selected_filter_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".config")
+        .join("chart-app")
+        .join("selected_filter.json")
+}
+
+pub fn load_selected_filter() -> Option<String> {
+    let path = selected_filter_path();
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+pub fn save_selected_filter(name: &str) {
+    let path = selected_filter_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(name) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 // ── App settings (stock-dl config) ──
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -116,10 +145,20 @@ impl Default for DlSettings {
 #[derive(Serialize, Clone)]
 pub struct AppSettings {
     pub dl: DlSettings,
-    pub data_filters: Vec<String>,
+    pub data_filters: Vec<NamedFilter>,
     pub ma: Vec<usize>,
     pub chip: ChipSettings,
     pub ma_cluster: MaClusterSettings,
+}
+
+/// A named bundle of filter expressions. The user picks one of these from a
+/// dropdown in the Filtered tab; all expressions in `filters` must match for a
+/// stock to be included.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct NamedFilter {
+    pub name: String,
+    #[serde(default)]
+    pub filters: Vec<String>,
 }
 
 /// Tunables for the MA cluster score indicator.
@@ -293,8 +332,31 @@ fn default_stock_dl_binary() -> String {
 fn default_concurrency() -> usize {
     8
 }
-fn default_data_filters() -> Vec<String> {
+fn default_data_filters() -> Vec<NamedFilter> {
     Vec::new()
+}
+
+/// Accepts either the new shape (`[{name, filters}, ...]`) or the legacy plain
+/// list of expressions (`["price > ma60", ...]`), in which case it's wrapped as
+/// a single unnamed bundle so old `settings.json` files keep working.
+fn deserialize_data_filters<'de, D>(deserializer: D) -> Result<Vec<NamedFilter>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Named(Vec<NamedFilter>),
+        Legacy(Vec<String>),
+    }
+    Ok(match Either::deserialize(deserializer)? {
+        Either::Named(v) => v,
+        Either::Legacy(v) if v.is_empty() => Vec::new(),
+        Either::Legacy(v) => vec![NamedFilter {
+            name: "default".to_string(),
+            filters: v,
+        }],
+    })
 }
 
 fn default_ma() -> Vec<usize> {
@@ -323,8 +385,8 @@ struct LegacyAppSettings {
     stock_dl_binary: String,
     #[serde(default = "default_concurrency")]
     concurrency: usize,
-    #[serde(default = "default_data_filters")]
-    data_filters: Vec<String>,
+    #[serde(default = "default_data_filters", deserialize_with = "deserialize_data_filters")]
+    data_filters: Vec<NamedFilter>,
     #[serde(default)]
     ma: Option<Vec<usize>>,
     // Legacy top-level alias for `ma`.
@@ -1154,8 +1216,31 @@ mod tests {
         assert_eq!(parsed.dl.data_dir, "/some/dir");
         assert_eq!(parsed.dl.binary, "stock-dl");
         assert_eq!(parsed.dl.concurrency, 8);
-        assert_eq!(parsed.data_filters, vec!["price > ma60".to_string()]);
+        assert_eq!(
+            parsed.data_filters,
+            vec![NamedFilter {
+                name: "default".to_string(),
+                filters: vec!["price > ma60".to_string()],
+            }]
+        );
         assert_eq!(parsed.ma, vec![10, 30, 60]);
+    }
+
+    #[test]
+    fn parses_named_data_filters() {
+        let json = r#"{
+          "dl": { "data_dir": "/d", "binary": "stock-dl" },
+          "data_filters": [
+            { "name": "ma-cluster", "filters": ["cluster >= 60"] },
+            { "name": "ma60", "filters": ["price >= ma60"] }
+          ]
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.data_filters.len(), 2);
+        assert_eq!(parsed.data_filters[0].name, "ma-cluster");
+        assert_eq!(parsed.data_filters[0].filters, vec!["cluster >= 60".to_string()]);
+        assert_eq!(parsed.data_filters[1].name, "ma60");
+        assert_eq!(parsed.data_filters[1].filters, vec!["price >= ma60".to_string()]);
     }
 
     #[test]
