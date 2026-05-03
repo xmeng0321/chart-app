@@ -1,5 +1,7 @@
 use crate::chip::{calculate_chip_distribution, ChipCache};
-use crate::data::{Candle, ChipSettings, MaLine, TradeAgentResult};
+use crate::data::{
+    calculate_ma_cluster_score, Candle, ChipSettings, MaClusterSettings, MaLine, TradeAgentResult,
+};
 use eframe::egui::*;
 
 // TradingView dark theme colors
@@ -17,6 +19,7 @@ const PRICE_AXIS_WIDTH: f32 = 85.0;
 const TIME_AXIS_HEIGHT: f32 = 28.0;
 const VOLUME_RATIO: f32 = 0.18;
 const CHIP_PANEL_WIDTH: f32 = 120.0;
+const MA_CLUSTER_PANEL_HEIGHT: f32 = 80.0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum DragZone {
@@ -52,12 +55,14 @@ pub struct ChartState {
     pub agent_status: AgentStatus,
     pub selection_just_completed: bool,
     pub show_chip_distribution: bool,
+    pub show_ma_cluster_panel: bool,
     pub chip_cache: Option<ChipCache>,
     pub chip_settings: ChipSettings,
+    pub ma_cluster_settings: MaClusterSettings,
 }
 
 impl ChartState {
-    pub fn new(chip_settings: ChipSettings) -> Self {
+    pub fn new(chip_settings: ChipSettings, ma_cluster_settings: MaClusterSettings) -> Self {
         Self {
             offset: 0.0,
             candles_in_view: 120.0,
@@ -69,8 +74,10 @@ impl ChartState {
             agent_status: AgentStatus::Idle,
             selection_just_completed: false,
             show_chip_distribution: false,
+            show_ma_cluster_panel: false,
             chip_cache: None,
             chip_settings,
+            ma_cluster_settings,
         }
     }
 
@@ -131,15 +138,30 @@ pub fn draw_chart(
     } else {
         0.0
     };
+    let cluster_h = if state.show_ma_cluster_panel {
+        MA_CLUSTER_PANEL_HEIGHT
+    } else {
+        0.0
+    };
 
-    // Layout regions
+    // Layout regions. When the cluster subplot is visible, the main chart
+    // shrinks vertically to make room for it above the time axis.
+    let main_area_bottom = full_rect.max.y - TIME_AXIS_HEIGHT;
     let chart_rect = Rect::from_min_max(
         full_rect.min,
         pos2(
             full_rect.max.x - PRICE_AXIS_WIDTH - chip_w,
-            full_rect.max.y - TIME_AXIS_HEIGHT,
+            main_area_bottom - cluster_h,
         ),
     );
+    let cluster_panel_rect = if cluster_h > 0.0 {
+        Some(Rect::from_min_max(
+            pos2(chart_rect.min.x, chart_rect.max.y),
+            pos2(chart_rect.max.x, main_area_bottom),
+        ))
+    } else {
+        None
+    };
     let chip_rect = if state.show_chip_distribution {
         Some(Rect::from_min_max(
             pos2(chart_rect.max.x, chart_rect.min.y),
@@ -153,7 +175,7 @@ pub fn draw_chart(
         pos2(full_rect.max.x, chart_rect.max.y),
     );
     let time_axis_rect = Rect::from_min_max(
-        pos2(chart_rect.min.x, chart_rect.max.y),
+        pos2(chart_rect.min.x, main_area_bottom),
         pos2(chart_rect.max.x, full_rect.max.y),
     );
 
@@ -209,16 +231,6 @@ pub fn draw_chart(
     draw_price_axis(&painter, &price_axis_rect, state);
     draw_time_axis(&painter, &time_axis_rect, candles, state);
 
-    // Border between chart and axes
-    painter.line_segment(
-        [chart_rect.right_top(), chart_rect.right_bottom()],
-        Stroke::new(1.0, BORDER_COLOR),
-    );
-    painter.line_segment(
-        [chart_rect.left_bottom(), chart_rect.right_bottom()],
-        Stroke::new(1.0, BORDER_COLOR),
-    );
-
     // Crosshair & OHLCV tooltip
     let hovered_idx = if let Some(pos) = response.hover_pos() {
         if chart_rect.contains(pos) {
@@ -237,12 +249,55 @@ pub fn draw_chart(
             } else {
                 None
             }
+        } else if let Some(cp) = cluster_panel_rect {
+            if cp.contains(pos) {
+                let idx = x_to_idx(pos.x, state, &cp).round() as usize;
+                if idx < candles.len() {
+                    Some(idx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             None
         }
     } else {
         None
     };
+
+    // MA cluster subplot
+    if let Some(cp) = cluster_panel_rect {
+        draw_ma_cluster_panel(
+            &painter,
+            ma_lines,
+            state,
+            &cp,
+            &state.ma_cluster_settings,
+            candles.len(),
+            hovered_idx,
+        );
+    }
+
+    // Border between chart and axes (extends through the cluster panel when
+    // the subplot is visible).
+    let right_border_bottom = pos2(chart_rect.max.x, main_area_bottom);
+    painter.line_segment(
+        [chart_rect.right_top(), right_border_bottom],
+        Stroke::new(1.0, BORDER_COLOR),
+    );
+    painter.line_segment(
+        [pos2(chart_rect.min.x, main_area_bottom), right_border_bottom],
+        Stroke::new(1.0, BORDER_COLOR),
+    );
+    if let Some(cp) = cluster_panel_rect {
+        // Separator between main chart and cluster subplot.
+        painter.line_segment(
+            [pos2(cp.min.x, cp.min.y), pos2(cp.max.x, cp.min.y)],
+            Stroke::new(1.0, BORDER_COLOR),
+        );
+    }
 
     // Title (top-left)
     painter.text(
@@ -270,6 +325,14 @@ pub fn draw_chart(
             chart_rect.min.x + 10.0,
             chart_rect.min.y + 46.0,
         );
+        draw_ma_cluster_legend(
+            &painter,
+            ma_lines,
+            idx,
+            &state.ma_cluster_settings,
+            chart_rect.min.x + 10.0,
+            chart_rect.min.y + 62.0,
+        );
     } else {
         // Show MA legend for last visible candle
         let last_vis = ((state.offset + state.candles_in_view).ceil() as usize)
@@ -282,6 +345,14 @@ pub fn draw_chart(
             last_vis,
             chart_rect.min.x + 10.0,
             chart_rect.min.y + 28.0,
+        );
+        draw_ma_cluster_legend(
+            &painter,
+            ma_lines,
+            last_vis,
+            &state.ma_cluster_settings,
+            chart_rect.min.x + 10.0,
+            chart_rect.min.y + 44.0,
         );
     }
 
@@ -643,6 +714,160 @@ fn draw_ma_lines(
         // Flush remaining
         if segment.len() >= 2 {
             painter.add(Shape::line(segment, stroke));
+        }
+    }
+}
+
+fn draw_ma_cluster_legend(
+    painter: &Painter,
+    ma_lines: &[MaLine],
+    candle_idx: usize,
+    settings: &MaClusterSettings,
+    x: f32,
+    y: f32,
+) {
+    let font = FontId::proportional(11.0);
+    let score = calculate_ma_cluster_score(ma_lines, candle_idx, settings);
+
+    let (score_text, score_color) = match score {
+        Some(s) => {
+            let c = if s.score >= 70.0 {
+                Color32::from_rgb(0x4C, 0xAF, 0x50) // green
+            } else if s.score >= 40.0 {
+                Color32::from_rgb(0xFF, 0xC1, 0x07) // amber
+            } else {
+                Color32::from_rgb(0xEF, 0x53, 0x50) // red
+            };
+            (format!("簇:{:.1}", s.score), c)
+        }
+        None => ("簇:--".to_string(), TEXT_DIM),
+    };
+
+    let mut cx = x;
+    let g1 = painter.layout_no_wrap(score_text, font.clone(), score_color);
+    let w1 = g1.size().x;
+    painter.galley(pos2(cx, y), g1, score_color);
+    cx += w1 + 14.0;
+
+    let bull_text = match score {
+        Some(s) => format!("多头:{:.0}%", s.bull * 100.0),
+        None => "多头:--".to_string(),
+    };
+    let g2 = painter.layout_no_wrap(bull_text, font.clone(), TEXT_COLOR);
+    let w2 = g2.size().x;
+    painter.galley(pos2(cx, y), g2, TEXT_COLOR);
+    cx += w2 + 14.0;
+
+    let amp_text = match score {
+        Some(s) => format!("幅度:{:.1}%", s.amp_pct),
+        None => "幅度:--".to_string(),
+    };
+    let g3 = painter.layout_no_wrap(amp_text, font, TEXT_COLOR);
+    painter.galley(pos2(cx, y), g3, TEXT_COLOR);
+}
+
+fn draw_ma_cluster_panel(
+    painter: &Painter,
+    ma_lines: &[MaLine],
+    state: &ChartState,
+    rect: &Rect,
+    settings: &MaClusterSettings,
+    n_candles: usize,
+    hovered_idx: Option<usize>,
+) {
+    painter.rect_filled(*rect, 0.0, BG_COLOR);
+    let clipped = painter.with_clip_rect(*rect);
+
+    let y_for_score = |s: f64| -> f32 {
+        let t = (s.clamp(0.0, 100.0) / 100.0) as f32;
+        rect.max.y - t * rect.height()
+    };
+
+    let amber = Color32::from_rgb(0xFF, 0xC1, 0x07);
+    let green = Color32::from_rgb(0x4C, 0xAF, 0x50);
+    let red = Color32::from_rgb(0xEF, 0x53, 0x50);
+
+    // Threshold dashed lines at 40 (amber) and 70 (green).
+    draw_dashed_line_h(
+        &clipped,
+        rect.min.x,
+        rect.max.x,
+        y_for_score(40.0),
+        amber.linear_multiply(0.35),
+        0.5,
+    );
+    draw_dashed_line_h(
+        &clipped,
+        rect.min.x,
+        rect.max.x,
+        y_for_score(70.0),
+        green.linear_multiply(0.35),
+        0.5,
+    );
+
+    // Score polyline across visible range. Break segments where the score is
+    // undefined (e.g. before MA240 is ready).
+    let (start, end) = visible_range(state, n_candles);
+    let stroke = Stroke::new(1.2, amber);
+    let mut segment: Vec<Pos2> = Vec::new();
+    let flush = |seg: &mut Vec<Pos2>, painter: &Painter| {
+        if seg.len() >= 2 {
+            painter.add(Shape::line(seg.clone(), stroke));
+        }
+        seg.clear();
+    };
+    for j in start..end {
+        match calculate_ma_cluster_score(ma_lines, j, settings) {
+            Some(s) => {
+                let x = idx_to_x(j as f64 + 0.5, state, rect);
+                let y = y_for_score(s.score);
+                segment.push(pos2(x, y));
+            }
+            None => flush(&mut segment, &clipped),
+        }
+    }
+    flush(&mut segment, &clipped);
+
+    // Right-edge scale labels.
+    let label_font = FontId::proportional(10.0);
+    for score in [0.0, 50.0, 100.0] {
+        painter.text(
+            pos2(rect.max.x - 2.0, y_for_score(score)),
+            Align2::RIGHT_CENTER,
+            format!("{:.0}", score),
+            label_font.clone(),
+            TEXT_DIM,
+        );
+    }
+
+    // Panel title.
+    painter.text(
+        pos2(rect.min.x + 6.0, rect.min.y + 4.0),
+        Align2::LEFT_TOP,
+        "簇分",
+        FontId::proportional(11.0),
+        TEXT_DIM,
+    );
+
+    // Hovered-candle crosshair + value readout.
+    if let Some(idx) = hovered_idx {
+        let x = idx_to_x(idx as f64 + 0.5, state, rect);
+        draw_dashed_line_v(&clipped, x, rect.min.y, rect.max.y, CROSSHAIR_COLOR, 0.5);
+        if let Some(s) = calculate_ma_cluster_score(ma_lines, idx, settings) {
+            let color = if s.score >= 70.0 {
+                green
+            } else if s.score >= 40.0 {
+                amber
+            } else {
+                red
+            };
+            painter.text(
+                pos2(rect.min.x + 40.0, rect.min.y + 4.0),
+                Align2::LEFT_TOP,
+                format!("{:.1}", s.score),
+                FontId::proportional(11.0),
+                color,
+            );
         }
     }
 }

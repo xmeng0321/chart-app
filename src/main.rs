@@ -110,7 +110,7 @@ impl ChartApp {
             ma_lines: Vec::new(),
             ma_visible: Vec::new(),
             ma_windows: settings.ma.clone(),
-            chart_state: ChartState::new(settings.chip.clone()),
+            chart_state: ChartState::new(settings.chip.clone(), settings.ma_cluster.clone()),
             csv_path: None,
             agent_receiver: None,
             model: "auto".to_string(),
@@ -529,6 +529,7 @@ impl ChartApp {
 
         let ma_windows = settings.ma.clone();
         let chip_settings = settings.chip.clone();
+        let ma_cluster_settings = settings.ma_cluster.clone();
         let data_dir = self.resolve_data_dir();
         let ctx = ctx.clone();
 
@@ -549,7 +550,13 @@ impl ChartApp {
             let mut matched_secids = Vec::new();
 
             for (i, (info, dir)) in stocks.iter().enumerate() {
-                if evaluate_filters_on_stock(dir, &filters, &ma_windows, &chip_settings) {
+                if evaluate_filters_on_stock(
+                    dir,
+                    &filters,
+                    &ma_windows,
+                    &chip_settings,
+                    &ma_cluster_settings,
+                ) {
                     matched_secids.push(info.secid.clone());
                 }
 
@@ -1075,6 +1082,24 @@ impl eframe::App for ChartApp {
                     self.chart_state.show_chip_distribution =
                         !self.chart_state.show_chip_distribution;
                     self.chart_state.chip_cache = None;
+                }
+
+                // MA cluster subplot toggle
+                let cluster_text = if self.chart_state.show_ma_cluster_panel {
+                    egui::RichText::new("簇图")
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0xFF, 0xC1, 0x07))
+                } else {
+                    egui::RichText::new("簇图")
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0x55, 0x55, 0x55))
+                };
+                if ui
+                    .selectable_label(self.chart_state.show_ma_cluster_panel, cluster_text)
+                    .clicked()
+                {
+                    self.chart_state.show_ma_cluster_panel =
+                        !self.chart_state.show_ma_cluster_panel;
                 }
 
                 ui.separator();
