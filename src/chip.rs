@@ -84,13 +84,7 @@ pub fn calculate_chip_distribution(
         let new_chips = turnover_rate;
 
         distribute_new_chips(
-            &mut chips,
-            c,
-            price_min,
-            price_max,
-            bin_width,
-            new_chips,
-            settings,
+            &mut chips, c, price_min, price_max, bin_width, new_chips, settings,
         );
     }
 
@@ -117,9 +111,7 @@ pub fn calculate_chip_distribution(
     // intraday range. Quantiles are the standard fix used by chip-distribution
     // tools.
     let q_low = settings.cost_quantile_low.clamp(0.0, 1.0);
-    let q_high = settings
-        .cost_quantile_high
-        .clamp(q_low, 1.0);
+    let q_high = settings.cost_quantile_high.clamp(q_low, 1.0);
     let (cost_low, cost_high) =
         cost_band_from_quantiles(&chips, price_min, bin_width, q_low, q_high);
 
@@ -439,12 +431,7 @@ fn cost_band_from_quantiles(
     (cost_low.unwrap_or(0.0), cost_high.unwrap_or(last_price))
 }
 
-fn compute_profit_ratio(
-    chips: &[f64],
-    price_min: f64,
-    bin_width: f64,
-    ref_price: f64,
-) -> f64 {
+fn compute_profit_ratio(chips: &[f64], price_min: f64, bin_width: f64, ref_price: f64) -> f64 {
     let total: f64 = chips.iter().sum();
     if total <= 0.0 || bin_width <= 0.0 {
         return 0.0;
@@ -679,11 +666,7 @@ mod tests {
     #[test]
     fn amount_anchor_moves_cost_center_toward_average_trade_price() {
         let s = settings();
-        let baseline = calculate_chip_distribution(
-            &[candle(10.0, 14.0, 15.0, 9.0, 100.0)],
-            0,
-            &s,
-        );
+        let baseline = calculate_chip_distribution(&[candle(10.0, 14.0, 15.0, 9.0, 100.0)], 0, &s);
         let anchored = calculate_chip_distribution(
             &[candle_with_amount(
                 10.0,
@@ -769,20 +752,14 @@ mod tests {
     fn profit_ratio_reflects_chips_below_ref_price() {
         // close=14 is near the top of the range, so most chip mass should sit
         // below it → high profit ratio.
-        let bullish = calculate_chip_distribution(
-            &[candle(10.0, 14.0, 15.0, 9.0, 100.0)],
-            0,
-            &settings(),
-        );
+        let bullish =
+            calculate_chip_distribution(&[candle(10.0, 14.0, 15.0, 9.0, 100.0)], 0, &settings());
         assert!(bullish.profit_ratio > 0.5);
         assert!(bullish.profit_ratio <= 1.0);
 
         // Conversely, close near the bottom → low profit ratio.
-        let bearish = calculate_chip_distribution(
-            &[candle(14.0, 10.0, 15.0, 9.0, 100.0)],
-            0,
-            &settings(),
-        );
+        let bearish =
+            calculate_chip_distribution(&[candle(14.0, 10.0, 15.0, 9.0, 100.0)], 0, &settings());
         assert!(bearish.profit_ratio < 0.5);
         assert!(bearish.profit_ratio >= 0.0);
     }
@@ -797,16 +774,20 @@ mod tests {
 
         // amount → avg trade price ≈ 10.2 (close to day_low). With strength=1
         // we should land closer to that anchor than with strength=0.
-        let candles = [candle_with_amount(10.0, 14.0, 15.0, 9.0, 100.0, Some(102_000.0))];
+        let candles = [candle_with_amount(
+            10.0,
+            14.0,
+            15.0,
+            9.0,
+            100.0,
+            Some(102_000.0),
+        )];
 
         let strong_dist = calculate_chip_distribution(&candles, 0, &strong);
         let weak_dist = calculate_chip_distribution(&candles, 0, &weak);
 
         let target = 10.2;
-        assert!(
-            (strong_dist.cost_center - target).abs()
-                < (weak_dist.cost_center - target).abs()
-        );
+        assert!((strong_dist.cost_center - target).abs() < (weak_dist.cost_center - target).abs());
     }
 
     #[test]

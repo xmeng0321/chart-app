@@ -98,14 +98,14 @@ impl ChartState {
 /// Return TradingView-style color for a given MA period
 pub fn ma_color(period: usize) -> Color32 {
     match period {
-        5 => Color32::from_rgb(0xFF, 0xEB, 0x3B),          // Yellow
-        10 => Color32::from_rgb(0x29, 0x62, 0xFF),         // Blue
-        20 => Color32::from_rgb(0xFF, 0x98, 0x00),         // Orange
-        30 => Color32::from_rgb(0xE9, 0x1E, 0x63),         // Pink
-        60 => Color32::from_rgb(0xAB, 0x47, 0xBC),         // Purple
-        120 => Color32::from_rgb(0x00, 0xBC, 0xD4),        // Cyan
-        240 | 250 => Color32::from_rgb(0x4C, 0xAF, 0x50),  // Green
-        _ => Color32::from_rgb(0xBB, 0xBB, 0xBB),          // Gray fallback
+        5 => Color32::from_rgb(0xFF, 0xEB, 0x3B),         // Yellow
+        10 => Color32::from_rgb(0x29, 0x62, 0xFF),        // Blue
+        20 => Color32::from_rgb(0xFF, 0x98, 0x00),        // Orange
+        30 => Color32::from_rgb(0xE9, 0x1E, 0x63),        // Pink
+        60 => Color32::from_rgb(0xAB, 0x47, 0xBC),        // Purple
+        120 => Color32::from_rgb(0x00, 0xBC, 0xD4),       // Cyan
+        240 | 250 => Color32::from_rgb(0x4C, 0xAF, 0x50), // Green
+        _ => Color32::from_rgb(0xBB, 0xBB, 0xBB),         // Gray fallback
     }
 }
 
@@ -288,7 +288,10 @@ pub fn draw_chart(
         Stroke::new(1.0, BORDER_COLOR),
     );
     painter.line_segment(
-        [pos2(chart_rect.min.x, main_area_bottom), right_border_bottom],
+        [
+            pos2(chart_rect.min.x, main_area_bottom),
+            right_border_bottom,
+        ],
         Stroke::new(1.0, BORDER_COLOR),
     );
     if let Some(cp) = cluster_panel_rect {
@@ -1489,13 +1492,16 @@ fn draw_price_levels(
     if start >= end {
         return;
     }
-    let base = candles[start..end].iter().map(|c| c.low).fold(f64::MAX, f64::min);
+    let base = candles[start..end]
+        .iter()
+        .map(|c| c.low)
+        .fold(f64::MAX, f64::min);
     if base <= 0.0 {
         return;
     }
 
     // Amber, kept subtle so it reads clearly without dominating the chart
-    let line_color  = Color32::from_rgba_unmultiplied(0xFF, 0xC1, 0x07, 0x48);
+    let line_color = Color32::from_rgba_unmultiplied(0xFF, 0xC1, 0x07, 0x48);
     let label_color = Color32::from_rgba_unmultiplied(0xFF, 0xC1, 0x07, 0xA8);
 
     // Skip to the first level that could be visible (at or just below price_min)
@@ -1598,4 +1604,3 @@ fn nice_step(range: f64, target_steps: usize) -> f64 {
 fn format_price(price: f64) -> String {
     format!("{:.2}", price)
 }
-

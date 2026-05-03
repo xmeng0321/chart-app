@@ -39,21 +39,60 @@ pub fn filtered_path() -> PathBuf {
         .join("filtered.json")
 }
 
-pub fn load_filtered() -> Vec<String> {
+const DEFAULT_FILTER_KEY: &str = "default";
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FilteredStore {
+    ByName(HashMap<String, Vec<String>>),
+    Legacy(Vec<String>),
+}
+
+fn filtered_key(filter_name: Option<&str>) -> String {
+    filter_name
+        .filter(|name| !name.is_empty())
+        .unwrap_or(DEFAULT_FILTER_KEY)
+        .to_string()
+}
+
+pub fn load_filtered(filter_name: Option<&str>) -> Vec<String> {
     let path = filtered_path();
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        Vec::new()
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+
+    match serde_json::from_str::<FilteredStore>(&content) {
+        Ok(FilteredStore::ByName(by_name)) => by_name
+            .get(&filtered_key(filter_name))
+            .cloned()
+            .unwrap_or_default(),
+        Ok(FilteredStore::Legacy(filtered)) => filtered,
+        Err(_) => Vec::new(),
     }
 }
 
-pub fn save_filtered(filtered: &[String]) {
+pub fn save_filtered(filter_name: Option<&str>, filtered: &[String]) {
     let path = filtered_path();
+    let key = filtered_key(filter_name);
+    let mut by_name = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<FilteredStore>(&content).ok())
+        .map(|store| match store {
+            FilteredStore::ByName(by_name) => by_name,
+            FilteredStore::Legacy(filtered) => {
+                let mut by_name = HashMap::new();
+                by_name.insert(key.clone(), filtered);
+                by_name
+            }
+        })
+        .unwrap_or_default();
+
+    by_name.insert(key, filtered.to_vec());
+
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_string_pretty(filtered) {
+    if let Ok(json) = serde_json::to_string_pretty(&by_name) {
         let _ = std::fs::write(&path, json);
     }
 }
@@ -911,11 +950,17 @@ pub struct FilterOperand {
 #[derive(Debug, Clone, Copy)]
 pub enum FilterOperator {
     GreaterThan,
+    GreaterThanOrEqual,
     LessThan,
+    LessThanOrEqual,
 }
 
 pub fn parse_data_filter(expr: &str) -> Result<DataFilter, String> {
-    let (left_str, op, right_str) = if let Some(pos) = expr.find('>') {
+    let (left_str, op, right_str) = if let Some(pos) = expr.find(">=") {
+        (&expr[..pos], FilterOperator::GreaterThanOrEqual, &expr[pos + 2..])
+    } else if let Some(pos) = expr.find("<=") {
+        (&expr[..pos], FilterOperator::LessThanOrEqual, &expr[pos + 2..])
+    } else if let Some(pos) = expr.find('>') {
         (&expr[..pos], FilterOperator::GreaterThan, &expr[pos + 1..])
     } else if let Some(pos) = expr.find('<') {
         (&expr[..pos], FilterOperator::LessThan, &expr[pos + 1..])
@@ -1079,7 +1124,9 @@ fn evaluate_filters_for_period(
 
         let pass = match filter.operator {
             FilterOperator::GreaterThan => lv > rv,
+            FilterOperator::GreaterThanOrEqual => lv >= rv,
             FilterOperator::LessThan => lv < rv,
+            FilterOperator::LessThanOrEqual => lv <= rv,
         };
 
         if !pass {
@@ -1241,6 +1288,19 @@ mod tests {
         assert_eq!(parsed.data_filters[0].filters, vec!["cluster >= 60".to_string()]);
         assert_eq!(parsed.data_filters[1].name, "ma60");
         assert_eq!(parsed.data_filters[1].filters, vec!["price >= ma60".to_string()]);
+    }
+
+    #[test]
+    fn parses_inclusive_filter_operators() {
+        let ge = parse_data_filter("cluster >= 60").unwrap();
+        assert!(matches!(ge.operator, FilterOperator::GreaterThanOrEqual));
+        assert_eq!(ge.left.column, "cluster");
+        assert_eq!(ge.right.column, "60");
+
+        let le = parse_data_filter("price <= ma30").unwrap();
+        assert!(matches!(le.operator, FilterOperator::LessThanOrEqual));
+        assert_eq!(le.left.column, "close");
+        assert_eq!(le.right.column, "ma30");
     }
 
     #[test]
@@ -1536,6 +1596,39 @@ mod tests {
 
         let configured = vec![10, 30, 60];
         let filters = vec![parse_data_filter("price > ma5").unwrap()];
+        assert!(evaluate_filters_on_stock(
+            &dir,
+            &filters,
+            &configured,
+            &ChipSettings::default(),
+            &MaClusterSettings::default()
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_resolves_inclusive_ma_bullish_chain() {
+        let dir = std::env::temp_dir().join("chart_app_filter_ma_bullish");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
+        for i in 1..=140 {
+            csv.push_str(&format!(
+                "2026-01-{:02},{v}.0,{v}.0,{v}.0,{v}.0,100,\n",
+                (i % 28) + 1,
+                v = i
+            ));
+        }
+        std::fs::write(dir.join("daily.csv"), csv).unwrap();
+
+        let configured = vec![10, 30, 60];
+        let filters = vec![
+            parse_data_filter("price >= ma30").unwrap(),
+            parse_data_filter("ma30 >= ma60").unwrap(),
+            parse_data_filter("ma60 >= ma120").unwrap(),
+        ];
         assert!(evaluate_filters_on_stock(
             &dir,
             &filters,

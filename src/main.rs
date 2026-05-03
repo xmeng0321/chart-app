@@ -102,7 +102,6 @@ impl ChartApp {
 
         let stocks = load_stock_list(&data_dir);
         let favorites = load_favorites();
-        let filtered = load_filtered();
         let last_selected_by_tab = load_last_selected();
         // Restore the previously chosen filter name, falling back to the first
         // available bundle so the dropdown always has a valid selection when
@@ -110,6 +109,7 @@ impl ChartApp {
         let selected_filter_name = load_selected_filter()
             .filter(|n| settings.data_filters.iter().any(|f| &f.name == n))
             .or_else(|| settings.data_filters.first().map(|f| f.name.clone()));
+        let filtered = load_filtered(selected_filter_name.as_deref());
         let mut app = Self {
             stocks,
             search: String::new(),
@@ -144,6 +144,13 @@ impl ChartApp {
         app.restore_selection_for_current_tab();
 
         app
+    }
+
+    fn reload_filtered_for_selected_filter(&mut self) {
+        self.filtered = load_filtered(self.selected_filter_name.as_deref());
+        if self.stock_tab == StockTab::Filtered {
+            self.restore_selection_for_current_tab();
+        }
     }
 
     fn select_stock(&mut self, idx: usize) {
@@ -540,6 +547,8 @@ impl ChartApp {
             }
         };
 
+        let filter_name = bundle.name.clone();
+
         let filters: Vec<DataFilter> = match bundle
             .filters
             .iter()
@@ -596,7 +605,7 @@ impl ChartApp {
             }
 
             matched_secids.sort();
-            save_filtered(&matched_secids);
+            save_filtered(Some(&filter_name), &matched_secids);
 
             let matched = matched_secids.len();
             let _ = tx.send(FilterMessage::Finished(Ok((matched, total))));
@@ -707,7 +716,7 @@ impl eframe::App for ChartApp {
                             Ok((matched, total)) => {
                                 self.filter_status =
                                     FilterStatus::Done { matched, total };
-                                self.filtered = load_filtered();
+                                self.filtered = load_filtered(self.selected_filter_name.as_deref());
                             }
                             Err(e) => {
                                 self.filter_status = FilterStatus::Error(e);
@@ -720,6 +729,9 @@ impl eframe::App for ChartApp {
         }
         if filter_done {
             self.filter_receiver = None;
+            if self.stock_tab == StockTab::Filtered {
+                self.restore_selection_for_current_tab();
+            }
         }
 
         // Poll single-stock auto-sync
@@ -914,22 +926,25 @@ impl eframe::App for ChartApp {
                                 .selected_filter_name
                                 .clone()
                                 .unwrap_or_else(|| available_filters[0].clone());
-                            egui::ComboBox::from_id_salt("filter-bundle-select")
-                                .selected_text(egui::RichText::new(&current).size(12.0))
-                                .show_ui(ui, |ui| {
-                                    for name in &available_filters {
-                                        ui.selectable_value(
-                                            &mut self.selected_filter_name,
-                                            Some(name.clone()),
-                                            name.as_str(),
-                                        );
-                                    }
-                                });
+                            ui.add_enabled_ui(!is_filtering, |ui| {
+                                egui::ComboBox::from_id_salt("filter-bundle-select")
+                                    .selected_text(egui::RichText::new(&current).size(12.0))
+                                    .show_ui(ui, |ui| {
+                                        for name in &available_filters {
+                                            ui.selectable_value(
+                                                &mut self.selected_filter_name,
+                                                Some(name.clone()),
+                                                name.as_str(),
+                                            );
+                                        }
+                                    });
+                            });
                         });
                         if self.selected_filter_name != prev_filter {
                             if let Some(name) = &self.selected_filter_name {
                                 save_selected_filter(name);
                             }
+                            self.reload_filtered_for_selected_filter();
                         }
                     }
 
