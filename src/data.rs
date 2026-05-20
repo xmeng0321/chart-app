@@ -186,8 +186,6 @@ pub struct AppSettings {
     pub dl: DlSettings,
     pub data_filters: Vec<NamedFilter>,
     pub ma: Vec<usize>,
-    pub chip: ChipSettings,
-    pub ma_cluster: MaClusterSettings,
 }
 
 /// A named bundle of filter expressions. The user picks one of these from a
@@ -198,166 +196,6 @@ pub struct NamedFilter {
     pub name: String,
     #[serde(default)]
     pub filters: Vec<String>,
-}
-
-/// Tunables for the MA cluster score indicator.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct MaClusterSettings {
-    /// Amplitudes below this (in %) incur no penalty — `compact = 1`.
-    /// Above the free zone the excess decays exponentially. Lets typical
-    /// clean-trend clusters score near the ceiling instead of being dragged
-    /// down by unavoidable spread.
-    #[serde(default = "default_ma_cluster_amplitude_free_zone")]
-    pub amplitude_free_zone: f64,
-    /// `k` in `compact = exp(-(amp_pct - free_zone) / k)`. Smaller = steeper
-    /// penalty once past the free zone.
-    #[serde(default = "default_ma_cluster_amplitude_scale")]
-    pub amplitude_scale: f64,
-    /// Exponent applied to `compact` in the final score. Lowers the amplitude
-    /// penalty's weight relative to bull alignment. 1.0 = original behaviour;
-    /// 0.5 (default) noticeably softens the spread penalty so a perfectly
-    /// bull-stacked but widely-spread rally still registers a meaningful score.
-    #[serde(default = "default_ma_cluster_amplitude_weight")]
-    pub amplitude_weight: f64,
-    /// Number of bars used to judge each MA's direction. An MA counts as
-    /// "rising" iff `value[idx] > value[idx - slope_lookback]`. When the
-    /// lookback is unavailable (too close to series start, or a NaN in the
-    /// past), slope is treated as neutral so early bars don't auto-fail.
-    #[serde(default = "default_ma_cluster_slope_lookback")]
-    pub slope_lookback: usize,
-}
-
-fn default_ma_cluster_amplitude_free_zone() -> f64 {
-    5.0
-}
-fn default_ma_cluster_amplitude_scale() -> f64 {
-    10.0
-}
-fn default_ma_cluster_amplitude_weight() -> f64 {
-    0.5
-}
-fn default_ma_cluster_slope_lookback() -> usize {
-    5
-}
-
-impl Default for MaClusterSettings {
-    fn default() -> Self {
-        Self {
-            amplitude_free_zone: default_ma_cluster_amplitude_free_zone(),
-            amplitude_scale: default_ma_cluster_amplitude_scale(),
-            amplitude_weight: default_ma_cluster_amplitude_weight(),
-            slope_lookback: default_ma_cluster_slope_lookback(),
-        }
-    }
-}
-
-/// Tunable parameters for the chip (筹码) distribution model. All fields fall
-/// back to sensible defaults so an existing settings.json without a `chip`
-/// section keeps working.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct ChipSettings {
-    /// Per-day turnover used when no volume baseline is available.
-    #[serde(default = "default_fallback_turnover_rate")]
-    pub fallback_turnover_rate: f64,
-    /// Lower clamp on per-day turnover so very thin sessions still decay chips.
-    #[serde(default = "default_min_turnover_rate")]
-    pub min_turnover_rate: f64,
-    /// Upper clamp so a single huge volume bar can't wipe the historical chip
-    /// memory in one day.
-    #[serde(default = "default_max_turnover_rate")]
-    pub max_turnover_rate: f64,
-    /// Trailing-window length used to derive the local volume baseline.
-    #[serde(default = "default_turnover_baseline_days")]
-    pub turnover_baseline_days: usize,
-    /// Exponent applied to the (volume / baseline) ratio. < 1 dampens spikes.
-    #[serde(default = "default_volume_ratio_exponent")]
-    pub volume_ratio_exponent: f64,
-    /// Minimum trading days the lookback should cover before exiting early.
-    #[serde(default = "default_min_lookback")]
-    pub min_lookback: usize,
-    /// Hard cap on lookback length.
-    #[serde(default = "default_max_lookback")]
-    pub max_lookback: usize,
-    /// Once residual chip mass falls below this, older days are dropped.
-    #[serde(default = "default_residual_mass_cutoff")]
-    pub residual_mass_cutoff: f64,
-    /// Lower clamp on bin count.
-    #[serde(default = "default_min_bins")]
-    pub min_bins: usize,
-    /// Upper clamp on bin count.
-    #[serde(default = "default_max_bins")]
-    pub max_bins: usize,
-    /// Lower mass quantile used to pick `cost_low` (e.g. 0.05 = 5%).
-    #[serde(default = "default_cost_quantile_low")]
-    pub cost_quantile_low: f64,
-    /// Upper mass quantile used to pick `cost_high` (e.g. 0.95 = 95%).
-    #[serde(default = "default_cost_quantile_high")]
-    pub cost_quantile_high: f64,
-    /// Multiplier on the price-anchor weight inside `distribute_new_chips`.
-    /// 1.0 keeps original behaviour; > 1 trusts the amount-derived avg price
-    /// more.
-    #[serde(default = "default_anchor_strength")]
-    pub anchor_strength: f64,
-}
-
-fn default_fallback_turnover_rate() -> f64 {
-    0.03
-}
-fn default_min_turnover_rate() -> f64 {
-    0.001
-}
-fn default_max_turnover_rate() -> f64 {
-    0.30
-}
-fn default_turnover_baseline_days() -> usize {
-    40
-}
-fn default_volume_ratio_exponent() -> f64 {
-    0.5
-}
-fn default_min_lookback() -> usize {
-    60
-}
-fn default_max_lookback() -> usize {
-    480
-}
-fn default_residual_mass_cutoff() -> f64 {
-    0.03
-}
-fn default_min_bins() -> usize {
-    96
-}
-fn default_max_bins() -> usize {
-    240
-}
-fn default_cost_quantile_low() -> f64 {
-    0.05
-}
-fn default_cost_quantile_high() -> f64 {
-    0.95
-}
-fn default_anchor_strength() -> f64 {
-    1.0
-}
-
-impl Default for ChipSettings {
-    fn default() -> Self {
-        Self {
-            fallback_turnover_rate: default_fallback_turnover_rate(),
-            min_turnover_rate: default_min_turnover_rate(),
-            max_turnover_rate: default_max_turnover_rate(),
-            turnover_baseline_days: default_turnover_baseline_days(),
-            volume_ratio_exponent: default_volume_ratio_exponent(),
-            min_lookback: default_min_lookback(),
-            max_lookback: default_max_lookback(),
-            residual_mass_cutoff: default_residual_mass_cutoff(),
-            min_bins: default_min_bins(),
-            max_bins: default_max_bins(),
-            cost_quantile_low: default_cost_quantile_low(),
-            cost_quantile_high: default_cost_quantile_high(),
-            anchor_strength: default_anchor_strength(),
-        }
-    }
 }
 
 fn default_data_dir() -> String {
@@ -408,8 +246,6 @@ impl Default for AppSettings {
             dl: DlSettings::default(),
             data_filters: default_data_filters(),
             ma: default_ma(),
-            chip: ChipSettings::default(),
-            ma_cluster: MaClusterSettings::default(),
         }
     }
 }
@@ -431,10 +267,6 @@ struct LegacyAppSettings {
     // Legacy top-level alias for `ma`.
     #[serde(default)]
     ma_windows: Option<Vec<usize>>,
-    #[serde(default)]
-    chip: ChipSettings,
-    #[serde(default)]
-    ma_cluster: MaClusterSettings,
 }
 
 /// Mirrors `DlSettings` but also tolerates the legacy `ma_windows` key so we
@@ -490,8 +322,6 @@ impl<'de> Deserialize<'de> for AppSettings {
             dl,
             data_filters: legacy.data_filters,
             ma,
-            chip: legacy.chip,
-            ma_cluster: legacy.ma_cluster,
         })
     }
 }
@@ -628,98 +458,6 @@ pub struct Candle {
 pub struct MaLine {
     pub period: usize,
     pub values: Vec<f64>, // same length as candles; NaN where insufficient data
-}
-
-/// Combined "MA cluster" score at a single candle. See
-/// `calculate_ma_cluster_score` for semantics.
-#[derive(Clone, Copy, Debug)]
-pub struct MaClusterScore {
-    pub amp_pct: f64, // (max - min) / min * 100
-    pub bull: f64,    // fraction of (shorter, longer) pairs with shorter > longer, 0..=1
-    pub score: f64,   // bull * exp(-amp_pct / amplitude_scale) * 100, 0..=100
-}
-
-/// Score how tight and how bull-aligned the configured moving averages are at
-/// `idx`. Returns `None` when fewer than two MAs have a valid value at that
-/// position (need at least one pair to score anything).
-///
-/// Only *adjacent* pairs in period-sorted order are evaluated (e.g. 5 vs 10,
-/// 10 vs 20, 20 vs 60), not every cross combination. A pair
-/// `(short_ma, long_ma)` counts as bullish iff all three hold:
-/// 1. `short_ma[idx] > long_ma[idx]` (correct order),
-/// 2. `short_ma` is rising over `slope_lookback` bars, and
-/// 3. `long_ma` is rising over `slope_lookback` bars.
-/// When slope history isn't available (too early in the series), that MA's
-/// slope is treated as neutral — i.e. the requirement is waived rather than
-/// failed, so early bars don't auto-zero.
-pub fn calculate_ma_cluster_score(
-    ma_lines: &[MaLine],
-    idx: usize,
-    settings: &MaClusterSettings,
-) -> Option<MaClusterScore> {
-    // Collect (period, value, is_rising) per MA in period-ascending order.
-    // Skip NaN / non-positive values (amplitude formula needs min > 0).
-    let mut entries: Vec<(usize, f64, bool)> = ma_lines
-        .iter()
-        .filter_map(|m| {
-            let v = *m.values.get(idx)?;
-            if v.is_nan() || v <= 0.0 {
-                return None;
-            }
-            // Rising check: current strictly greater than lookback-ago. If the
-            // past value isn't available, treat as neutral (true) so the pair
-            // isn't disqualified purely by young history.
-            let rising = match idx.checked_sub(settings.slope_lookback) {
-                Some(past_idx) => match m.values.get(past_idx) {
-                    Some(&past) if !past.is_nan() => v > past,
-                    _ => true,
-                },
-                None => true,
-            };
-            Some((m.period, v, rising))
-        })
-        .collect();
-    if entries.len() < 2 {
-        return None;
-    }
-    entries.sort_by_key(|e| e.0);
-
-    let values: Vec<f64> = entries.iter().map(|e| e.1).collect();
-    let rising: Vec<bool> = entries.iter().map(|e| e.2).collect();
-    let max = values.iter().cloned().fold(f64::MIN, f64::max);
-    let min = values.iter().cloned().fold(f64::MAX, f64::min);
-    let amp_pct = (max - min) / min * 100.0;
-
-    // Bull alignment: shorter period above longer period AND both MAs rising.
-    // Only adjacent pairs in period-sorted order are scored (5↔10, 10↔20, …),
-    // so bull is the fraction of consecutive MAs that are properly stacked.
-    let n = values.len();
-    let total_pairs = n - 1;
-    let mut correct = 0usize;
-    for i in 0..total_pairs {
-        if values[i] > values[i + 1] && rising[i] && rising[i + 1] {
-            correct += 1;
-        }
-    }
-    let bull = correct as f64 / total_pairs as f64;
-
-    let k = if settings.amplitude_scale > 0.0 {
-        settings.amplitude_scale
-    } else {
-        default_ma_cluster_amplitude_scale()
-    };
-    let free = settings.amplitude_free_zone.max(0.0);
-    let w = settings.amplitude_weight.max(0.0);
-    let excess = (amp_pct - free).max(0.0);
-    let compact = (-excess / k).exp();
-    let compact_weighted = if w == 0.0 { 1.0 } else { compact.powf(w) };
-    let score = bull * compact_weighted * 100.0;
-
-    Some(MaClusterScore {
-        amp_pct,
-        bull,
-        score,
-    })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1015,8 +753,6 @@ pub fn evaluate_filters_on_stock(
     stock_dir: &Path,
     filters: &[DataFilter],
     ma_windows: &[usize],
-    chip_settings: &ChipSettings,
-    ma_cluster_settings: &MaClusterSettings,
 ) -> bool {
     if filters.is_empty() {
         return true;
@@ -1044,15 +780,7 @@ pub fn evaluate_filters_on_stock(
     // or the weekly timeframe — weekly captures slower setups that the daily
     // view alone would miss.
     for period in [Period::Daily, Period::Weekly] {
-        if evaluate_filters_for_period(
-            stock_dir,
-            filters,
-            ma_windows,
-            &windows,
-            chip_settings,
-            ma_cluster_settings,
-            period,
-        ) {
+        if evaluate_filters_for_period(stock_dir, filters, ma_windows, &windows, period) {
             return true;
         }
     }
@@ -1063,10 +791,8 @@ pub fn evaluate_filters_on_stock(
 fn evaluate_filters_for_period(
     stock_dir: &Path,
     filters: &[DataFilter],
-    ma_windows: &[usize],
+    _ma_windows: &[usize],
     windows: &[usize],
-    chip_settings: &ChipSettings,
-    ma_cluster_settings: &MaClusterSettings,
     period: Period,
 ) -> bool {
     let (candles, ma_lines) = load_candles(stock_dir, period, windows);
@@ -1083,35 +809,9 @@ fn evaluate_filters_for_period(
         return false;
     }
 
-    let needs_chip = filters
-        .iter()
-        .any(|f| is_chip_column(&f.left.column) || is_chip_column(&f.right.column));
-
-    let chip_dist = if needs_chip {
-        Some(crate::chip::calculate_chip_distribution(
-            &candles,
-            candles.len() - 1,
-            chip_settings,
-        ))
-    } else {
-        None
-    };
-
-    // Cluster metrics must use only the configured MAs, not the augmented
-    // `windows` union (otherwise a filter like `ma480 > ma240` would quietly
-    // change what `cluster` means).
-    let cluster_ma_lines: Vec<MaLine> = ma_lines
-        .iter()
-        .filter(|m| ma_windows.contains(&m.period))
-        .cloned()
-        .collect();
-
     let ctx = FilterContext {
         candles: &candles,
         ma_lines: &ma_lines,
-        cluster_ma_lines: &cluster_ma_lines,
-        chip_dist: chip_dist.as_ref(),
-        ma_cluster_settings,
     };
 
     for filter in filters {
@@ -1137,33 +837,9 @@ fn evaluate_filters_for_period(
     true
 }
 
-fn is_chip_column(name: &str) -> bool {
-    matches!(name, "cbw" | "ckdp" | "cost_center" | "asr" | "winner")
-}
-
-fn is_cluster_column(name: &str) -> bool {
-    matches!(name, "cluster" | "bull" | "amp")
-}
-
-fn resolve_chip_value(dist: &crate::chip::ChipDistribution, column: &str) -> Option<f64> {
-    match column {
-        "cbw" => Some(dist.cbw),
-        "ckdp" => Some(dist.ckdp),
-        "cost_center" => Some(dist.cost_center),
-        // 获利盘比例 (Active Stock Ratio / WINNER 函数)。CBW/CKDP 都以百分比
-        // 出现，所以 asr 也乘以 100 保持一致——`asr > 50` 比 `asr > 0.5`
-        // 在表达式里更自然。`winner` 作为同义别名兼容通达信公式习惯。
-        "asr" | "winner" => Some(dist.profit_ratio * 100.0),
-        _ => None,
-    }
-}
-
 struct FilterContext<'a> {
     candles: &'a [Candle],
     ma_lines: &'a [MaLine],
-    cluster_ma_lines: &'a [MaLine],
-    chip_dist: Option<&'a crate::chip::ChipDistribution>,
-    ma_cluster_settings: &'a MaClusterSettings,
 }
 
 fn resolve_operand_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Option<f64> {
@@ -1172,25 +848,8 @@ fn resolve_operand_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Op
         return Some(val);
     }
 
-    if is_chip_column(&operand.column) {
-        return ctx
-            .chip_dist
-            .and_then(|d| resolve_chip_value(d, &operand.column));
-    }
-
     // offset 0 = latest, offset 1 = one before, ...
     let idx = ctx.candles.len().checked_sub(operand.offset + 1)?;
-
-    if is_cluster_column(&operand.column) {
-        let score =
-            calculate_ma_cluster_score(ctx.cluster_ma_lines, idx, ctx.ma_cluster_settings)?;
-        return match operand.column.as_str() {
-            "cluster" => Some(score.score),
-            "bull" => Some(score.bull * 100.0),
-            "amp" => Some(score.amp_pct),
-            _ => None,
-        };
-    }
 
     // MA columns (ma10, ma30, ma60, …) come from on-demand MA lines
     if let Some(period_str) = operand.column.strip_prefix("ma") {
@@ -1346,42 +1005,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_chip_section_falls_back_to_defaults() {
-        // Existing settings.json files won't have a `chip` key — they must
-        // still parse and surface ChipSettings::default().
-        let json = r#"{
-          "dl": { "data_dir": "/d", "binary": "stock-dl" }
-        }"#;
-        let parsed: AppSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.chip, ChipSettings::default());
-    }
-
-    #[test]
-    fn chip_section_overrides_only_specified_fields() {
-        // Partial chip overrides should replace the listed fields and leave
-        // the rest at their defaults.
-        let json = r#"{
-          "dl": { "data_dir": "/d", "binary": "stock-dl" },
-          "chip": {
-            "max_lookback": 240,
-            "cost_quantile_low": 0.10,
-            "cost_quantile_high": 0.90,
-            "anchor_strength": 1.5
-          }
-        }"#;
-        let parsed: AppSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.chip.max_lookback, 240);
-        assert!((parsed.chip.cost_quantile_low - 0.10).abs() < 1e-9);
-        assert!((parsed.chip.cost_quantile_high - 0.90).abs() < 1e-9);
-        assert!((parsed.chip.anchor_strength - 1.5).abs() < 1e-9);
-        // Untouched fields keep defaults.
-        let d = ChipSettings::default();
-        assert_eq!(parsed.chip.min_lookback, d.min_lookback);
-        assert_eq!(parsed.chip.min_bins, d.min_bins);
-        assert!((parsed.chip.fallback_turnover_rate - d.fallback_turnover_rate).abs() < 1e-9);
-    }
-
-    #[test]
     fn parses_legacy_settings_with_dropped_fields_ignored() {
         // Older settings files may still have source/periods/include_st. These
         // must not cause a parse failure.
@@ -1511,66 +1134,11 @@ mod tests {
 
         // price > ma10 should hold on a rising series
         let filters = vec![parse_data_filter("price > ma10").unwrap()];
-        assert!(evaluate_filters_on_stock(
-            &dir,
-            &filters,
-            &ma,
-            &ChipSettings::default(),
-            &MaClusterSettings::default()
-        ));
+        assert!(evaluate_filters_on_stock(&dir, &filters, &ma));
 
         // price < ma10 should not hold
         let filters = vec![parse_data_filter("price < ma10").unwrap()];
-        assert!(!evaluate_filters_on_stock(
-            &dir,
-            &filters,
-            &ma,
-            &ChipSettings::default(),
-            &MaClusterSettings::default()
-        ));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn filter_resolves_asr_chip_column() {
-        // Build a contrived series where the latest close sits near the top of
-        // the historical price range → most chips below it → ASR should be
-        // high. Then assert the filter `asr > 50` matches and `winner > 50`
-        // (alias) matches the same way.
-        let dir = std::env::temp_dir().join("chart_app_filter_asr");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // 80 rows with steadily rising closes from 10 → ~17.9, so the final
-        // close is near the top of accumulated chip mass.
-        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
-        for i in 0..80 {
-            let p = 10.0 + i as f64 * 0.1;
-            csv.push_str(&format!(
-                "2026-01-{:02},{p},{p},{ph},{pl},100,\n",
-                (i % 28) + 1,
-                p = p,
-                ph = p + 0.1,
-                pl = p - 0.1,
-            ));
-        }
-        std::fs::write(dir.join("daily.csv"), csv).unwrap();
-
-        let ma = vec![10, 30, 60];
-        let chip = ChipSettings::default();
-
-        let cluster = MaClusterSettings::default();
-
-        let asr_filter = vec![parse_data_filter("asr > 50").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &asr_filter, &ma, &chip, &cluster));
-
-        let winner_filter = vec![parse_data_filter("winner > 50").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &winner_filter, &ma, &chip, &cluster));
-
-        // Sanity: asr > 200 can never hold (capped at 100).
-        let impossible = vec![parse_data_filter("asr > 200").unwrap()];
-        assert!(!evaluate_filters_on_stock(&dir, &impossible, &ma, &chip, &cluster));
+        assert!(!evaluate_filters_on_stock(&dir, &filters, &ma));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1596,13 +1164,7 @@ mod tests {
 
         let configured = vec![10, 30, 60];
         let filters = vec![parse_data_filter("price > ma5").unwrap()];
-        assert!(evaluate_filters_on_stock(
-            &dir,
-            &filters,
-            &configured,
-            &ChipSettings::default(),
-            &MaClusterSettings::default()
-        ));
+        assert!(evaluate_filters_on_stock(&dir, &filters, &configured));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1629,159 +1191,7 @@ mod tests {
             parse_data_filter("ma30 >= ma60").unwrap(),
             parse_data_filter("ma60 >= ma120").unwrap(),
         ];
-        assert!(evaluate_filters_on_stock(
-            &dir,
-            &filters,
-            &configured,
-            &ChipSettings::default(),
-            &MaClusterSettings::default()
-        ));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn ma_cluster_score_rewards_tight_bull_alignment() {
-        // Two MAs in perfect bull order with tiny spread → score near 100.
-        // Single-bar history means slope data is unavailable, so the slope
-        // check is waived (treated as rising) rather than auto-failing.
-        let settings = MaClusterSettings::default();
-        let ma_lines = vec![
-            MaLine { period: 10, values: vec![100.5] },
-            MaLine { period: 30, values: vec![100.0] },
-        ];
-        let s = calculate_ma_cluster_score(&ma_lines, 0, &settings).unwrap();
-        assert!(s.bull > 0.99, "bull = {}", s.bull);
-        assert!(s.amp_pct < 1.0, "amp = {}", s.amp_pct);
-        assert!(s.score > 90.0, "score = {}", s.score);
-
-        // Perfect bear order → bull = 0 → combined score = 0.
-        let bear = vec![
-            MaLine { period: 10, values: vec![90.0] },
-            MaLine { period: 30, values: vec![95.0] },
-            MaLine { period: 60, values: vec![100.0] },
-        ];
-        let s = calculate_ma_cluster_score(&bear, 0, &settings).unwrap();
-        assert_eq!(s.bull, 0.0);
-        assert_eq!(s.score, 0.0);
-    }
-
-    #[test]
-    fn ma_cluster_score_requires_rising_mas() {
-        // Bull-ordered at idx=5 but the shorter MA is falling — slope check
-        // must reject it so bull = 0 and score = 0.
-        let settings = MaClusterSettings {
-            amplitude_free_zone: 0.0,
-            amplitude_scale: 10.0,
-            amplitude_weight: 1.0,
-            slope_lookback: 5,
-        };
-        let ma10_drop = MaLine {
-            period: 10,
-            values: vec![105.0, 104.0, 103.5, 103.0, 102.5, 102.0],
-        };
-        let ma30_rise = MaLine {
-            period: 30,
-            values: vec![99.0, 99.3, 99.6, 99.9, 100.1, 100.4],
-        };
-        let lines = vec![ma10_drop, ma30_rise];
-        let s = calculate_ma_cluster_score(&lines, 5, &settings).unwrap();
-        assert_eq!(s.bull, 0.0);
-        assert_eq!(s.score, 0.0);
-    }
-
-    #[test]
-    fn ma_cluster_score_none_when_insufficient_values() {
-        let settings = MaClusterSettings::default();
-        let ma_lines = vec![MaLine { period: 10, values: vec![f64::NAN] }];
-        assert!(calculate_ma_cluster_score(&ma_lines, 0, &settings).is_none());
-
-        let ma_lines = vec![MaLine { period: 10, values: vec![10.0] }];
-        assert!(calculate_ma_cluster_score(&ma_lines, 0, &settings).is_none());
-    }
-
-    #[test]
-    fn filter_resolves_cluster_columns() {
-        // Rising series with MA10 > MA30 > MA60 at the final bar → strong bull,
-        // modest spread → `cluster > 50`, `bull = 100`, `amp` reasonable.
-        let dir = std::env::temp_dir().join("chart_app_filter_cluster");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
-        for i in 1..=80 {
-            let p = 10.0 + i as f64 * 0.1;
-            csv.push_str(&format!(
-                "2026-01-{:02},{p},{p},{p},{p},100,\n",
-                (i % 28) + 1
-            ));
-        }
-        std::fs::write(dir.join("daily.csv"), csv).unwrap();
-
-        let ma = vec![10, 30, 60];
-        let chip = ChipSettings::default();
-        let cluster = MaClusterSettings::default();
-
-        let bull = vec![parse_data_filter("bull > 99").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &bull, &ma, &chip, &cluster));
-
-        // A strictly rising series spread over 60 days must have amp > 0.
-        let amp = vec![parse_data_filter("amp > 0").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &amp, &ma, &chip, &cluster));
-
-        // On a rising series bull=100 but MA10/MA60 spread → compact < 1, so
-        // cluster lands somewhere in (0, 100). Just verify it's positive here.
-        let any_cluster = vec![parse_data_filter("cluster > 0").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &any_cluster, &ma, &chip, &cluster));
-
-        let impossible = vec![parse_data_filter("cluster > 200").unwrap()];
-        assert!(!evaluate_filters_on_stock(&dir, &impossible, &ma, &chip, &cluster));
-
-        // History offset works: 5 bars ago also satisfies bull on a monotonic series.
-        let bull_past = vec![parse_data_filter("bull[-5] > 99").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &bull_past, &ma, &chip, &cluster));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cluster_ignores_filter_only_ma_windows() {
-        // Even though the filter references ma5 (not in configured windows),
-        // the cluster score must be based on the configured [10, 30, 60] only.
-        // We assert that the cluster score is computed from ≤3 MAs by checking
-        // that total_pairs = C(3, 2) = 3, not C(4, 2) = 6. We verify indirectly:
-        // for a monotonic rising series, all pairs are correctly bull-ordered,
-        // so bull = 100 regardless of which MAs we include. Instead we check
-        // that amp is what we'd expect from the 3 configured MAs only.
-        let dir = std::env::temp_dir().join("chart_app_cluster_isolation");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
-        for i in 1..=80 {
-            let p = 10.0 + i as f64 * 0.1;
-            csv.push_str(&format!(
-                "2026-01-{:02},{p},{p},{p},{p},100,\n",
-                (i % 28) + 1
-            ));
-        }
-        std::fs::write(dir.join("daily.csv"), csv).unwrap();
-
-        let ma = vec![10, 30, 60];
-        let chip = ChipSettings::default();
-        let cluster = MaClusterSettings::default();
-
-        // A filter that unions ma5 into windows should not change cluster's
-        // inputs. Both should evaluate identically.
-        let with_ma5 = vec![
-            parse_data_filter("ma5 > 0").unwrap(),
-            parse_data_filter("cluster > 5").unwrap(),
-        ];
-        let without_ma5 = vec![parse_data_filter("cluster > 5").unwrap()];
-        assert_eq!(
-            evaluate_filters_on_stock(&dir, &with_ma5, &ma, &chip, &cluster),
-            evaluate_filters_on_stock(&dir, &without_ma5, &ma, &chip, &cluster)
-        );
+        assert!(evaluate_filters_on_stock(&dir, &filters, &configured));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
