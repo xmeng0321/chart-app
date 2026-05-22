@@ -406,16 +406,28 @@ impl ChartApp {
             // Read stdout line-by-line for progress
             let stdout = child.stdout.take().unwrap();
             let reader = std::io::BufReader::new(stdout);
-            let mut last_success = 0;
-            let mut last_failed = 0;
+            // New stock-dl format: separate updated / skipped / failed fields.
+            // Old format: a single `finished: success=N, failed=M` line.
+            let mut last_updated = 0usize;
+            let mut last_skipped = 0usize;
+            let mut last_failed = 0usize;
 
             for line in reader.lines() {
                 let Ok(line) = line else { continue };
                 eprintln!("[stock-dl] {}", line);
 
                 if let Some((s, f)) = parse_finished_line(&line) {
-                    last_success = s;
+                    // Old stock-dl: `finished: success=N, failed=M`
+                    last_updated = s;
                     last_failed = f;
+                } else if let Some((key, n)) = parse_dl_summary_field(&line) {
+                    // New stock-dl: `  updated  : N`, `  skipped  : N`, `  failed   : N`
+                    match key {
+                        "updated" => last_updated = n,
+                        "skipped" => last_skipped = n,
+                        "failed" => last_failed = n,
+                        _ => {}
+                    }
                 } else if let Some((pct, completed, total, stock_label)) =
                     parse_progress_line(&line)
                 {
@@ -436,8 +448,10 @@ impl ChartApp {
                 .map(|stderr| std::io::read_to_string(stderr).unwrap_or_default())
                 .unwrap_or_default();
 
+            // Skipped = already up-to-date, which is a successful outcome.
+            let success = last_updated + last_skipped;
             let result = match status {
-                Ok(s) if s.success() => Ok((last_success, last_failed)),
+                Ok(s) if s.success() => Ok((success, last_failed)),
                 Ok(_) => Err(if stderr_output.is_empty() {
                     "stock-dl exited with error".to_string()
                 } else {
@@ -546,6 +560,7 @@ impl ChartApp {
         };
 
         let filter_name = bundle.name.clone();
+        let filter_periods = bundle.periods.clone();
 
         let filters: Vec<DataFilter> = match bundle
             .filters
@@ -581,7 +596,7 @@ impl ChartApp {
             let mut matched_secids = Vec::new();
 
             for (i, (info, dir)) in stocks.iter().enumerate() {
-                if evaluate_filters_on_stock(dir, &filters, &ma_windows) {
+                if evaluate_filters_on_stock(dir, &filters, &ma_windows, &filter_periods) {
                     matched_secids.push(info.secid.clone());
                 }
 
@@ -929,6 +944,29 @@ impl eframe::App for ChartApp {
                                         }
                                     });
                             });
+                            // Show which timeframe(s) the active filter runs on.
+                            let period_label = {
+                                let settings = load_settings();
+                                settings
+                                    .data_filters
+                                    .iter()
+                                    .find(|f| Some(&f.name) == self.selected_filter_name.as_ref())
+                                    .map(|f| {
+                                        let has_daily = f.periods.contains(&Period::Daily) || f.periods.is_empty();
+                                        let has_weekly = f.periods.contains(&Period::Weekly);
+                                        match (has_daily, has_weekly) {
+                                            (true, true) => "日+周",
+                                            (false, true) => "周",
+                                            _ => "日",
+                                        }
+                                    })
+                                    .unwrap_or("日")
+                            };
+                            ui.label(
+                                egui::RichText::new(format!("[{period_label}]"))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(0x90, 0xCA, 0xF9)),
+                            );
                         });
                         if self.selected_filter_name != prev_filter {
                             if let Some(name) = &self.selected_filter_name {

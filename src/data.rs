@@ -188,14 +188,24 @@ pub struct AppSettings {
     pub ma: Vec<usize>,
 }
 
+fn default_filter_periods() -> Vec<Period> {
+    vec![Period::Daily]
+}
+
 /// A named bundle of filter expressions. The user picks one of these from a
 /// dropdown in the Filtered tab; all expressions in `filters` must match for a
 /// stock to be included.
+///
+/// `periods` controls which timeframes are evaluated. A stock passes if ALL
+/// conditions hold on ANY of the listed periods. Defaults to `["daily"]`.
+/// Use `["daily", "weekly"]` to match on either timeframe.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct NamedFilter {
     pub name: String,
     #[serde(default)]
     pub filters: Vec<String>,
+    #[serde(default = "default_filter_periods")]
+    pub periods: Vec<Period>,
 }
 
 fn default_data_dir() -> String {
@@ -232,6 +242,7 @@ where
         Either::Legacy(v) => vec![NamedFilter {
             name: "default".to_string(),
             filters: v,
+            periods: default_filter_periods(),
         }],
     })
 }
@@ -426,6 +437,23 @@ pub fn parse_finished_line(line: &str) -> Option<(usize, usize)> {
     Some((success?, failed?))
 }
 
+/// Parse a summary field line from the new stock-dl output format.
+///
+/// Lines look like `  updated  : 42 (with 1234 new bars)` or `  skipped  : 5015 (already fresh today)`.
+/// Returns `Some(("updated"|"skipped"|"failed"|"stocks", N))` or `None`.
+pub fn parse_dl_summary_field(line: &str) -> Option<(&str, usize)> {
+    let trimmed = line.trim();
+    let colon = trimmed.find(':')?;
+    let key = trimmed[..colon].trim();
+    // "data dir" has a space and its value is a path, not a count — skip it.
+    if key.contains(' ') {
+        return None;
+    }
+    let rest = trimmed[colon + 1..].trim();
+    let n: usize = rest.split_whitespace().next()?.parse().ok()?;
+    Some((key, n))
+}
+
 // ── Stock data types ──
 
 #[derive(Deserialize, Clone)]
@@ -460,7 +488,8 @@ pub struct MaLine {
     pub values: Vec<f64>, // same length as candles; NaN where insufficient data
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Period {
     Daily,
     Weekly,
@@ -682,7 +711,8 @@ pub struct DataFilter {
 #[derive(Debug, Clone)]
 pub struct FilterOperand {
     pub column: String,
-    pub offset: usize, // 0 = latest row, 1 = row[-1], etc.
+    pub offset: usize,              // 0 = latest row, N = N bars ago
+    pub divisor: Option<Box<FilterOperand>>, // Some(d) ⟹ this value / d
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -722,6 +752,27 @@ fn parse_filter_operand(s: &str) -> Result<FilterOperand, String> {
         return Err("Empty filter operand".to_string());
     }
 
+    // Support division: "price/price[200]" means current price / price 200 bars ago.
+    if let Some(slash_pos) = s.find('/') {
+        let num_str = s[..slash_pos].trim();
+        let den_str = s[slash_pos + 1..].trim();
+        let numerator = parse_single_operand(num_str)?;
+        let denominator = parse_single_operand(den_str)?;
+        return Ok(FilterOperand {
+            column: numerator.column,
+            offset: numerator.offset,
+            divisor: Some(Box::new(denominator)),
+        });
+    }
+
+    parse_single_operand(s)
+}
+
+fn parse_single_operand(s: &str) -> Result<FilterOperand, String> {
+    if s.is_empty() {
+        return Err("Empty filter operand".to_string());
+    }
+
     let (column, offset) = if let Some(bracket_start) = s.find('[') {
         let bracket_end = s
             .find(']')
@@ -731,10 +782,8 @@ fn parse_filter_operand(s: &str) -> Result<FilterOperand, String> {
         let offset_val: i64 = offset_str
             .parse()
             .map_err(|_| format!("Invalid offset in operand: {}", s))?;
-        if offset_val > 0 {
-            return Err(format!("Offset must be <= 0 in operand: {}", s));
-        }
-        (col.to_string(), (-offset_val) as usize)
+        // Accept price[200] (positive = bars ago) and price[-200] (negative = bars ago)
+        (col.to_string(), offset_val.unsigned_abs() as usize)
     } else {
         (s.to_string(), 0)
     };
@@ -746,13 +795,14 @@ fn parse_filter_operand(s: &str) -> Result<FilterOperand, String> {
         column.to_lowercase()
     };
 
-    Ok(FilterOperand { column, offset })
+    Ok(FilterOperand { column, offset, divisor: None })
 }
 
 pub fn evaluate_filters_on_stock(
     stock_dir: &Path,
     filters: &[DataFilter],
     ma_windows: &[usize],
+    periods: &[Period],
 ) -> bool {
     if filters.is_empty() {
         return true;
@@ -764,27 +814,31 @@ pub fn evaluate_filters_on_stock(
     let mut windows: Vec<usize> = ma_windows.to_vec();
     for f in filters {
         for operand in [&f.left, &f.right] {
-            if let Some(p) = operand
-                .column
-                .strip_prefix("ma")
-                .and_then(|s| s.parse::<usize>().ok())
-            {
-                if !windows.contains(&p) {
-                    windows.push(p);
+            let cols: &[&str] = &[
+                operand.column.as_str(),
+                operand.divisor.as_deref().map(|d| d.column.as_str()).unwrap_or(""),
+            ];
+            for col in cols.iter().filter(|c| !c.is_empty()) {
+                if let Some(p) = col.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
+                    if !windows.contains(&p) {
+                        windows.push(p);
+                    }
                 }
             }
         }
     }
 
-    // A stock qualifies if its conditions are satisfied on either the daily
-    // or the weekly timeframe — weekly captures slower setups that the daily
-    // view alone would miss.
-    for period in [Period::Daily, Period::Weekly] {
+    let eval_periods: &[Period] = if periods.is_empty() {
+        &[Period::Daily]
+    } else {
+        periods
+    };
+
+    for &period in eval_periods {
         if evaluate_filters_for_period(stock_dir, filters, ma_windows, &windows, period) {
             return true;
         }
     }
-
     false
 }
 
@@ -802,7 +856,12 @@ fn evaluate_filters_for_period(
 
     let max_offset = filters
         .iter()
-        .flat_map(|f| [f.left.offset, f.right.offset])
+        .flat_map(|f| {
+            let mut offsets = vec![f.left.offset, f.right.offset];
+            if let Some(d) = &f.left.divisor { offsets.push(d.offset); }
+            if let Some(d) = &f.right.divisor { offsets.push(d.offset); }
+            offsets
+        })
         .max()
         .unwrap_or(0);
     if candles.len() <= max_offset {
@@ -843,12 +902,25 @@ struct FilterContext<'a> {
 }
 
 fn resolve_operand_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Option<f64> {
+    let base = resolve_single_value(ctx, operand)?;
+    if let Some(div) = &operand.divisor {
+        let dv = resolve_single_value(ctx, div)?;
+        if dv == 0.0 {
+            return None;
+        }
+        Some(base / dv)
+    } else {
+        Some(base)
+    }
+}
+
+fn resolve_single_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Option<f64> {
     // Try parsing as numeric literal first (e.g. "50" in "cbw < 50")
     if let Ok(val) = operand.column.parse::<f64>() {
         return Some(val);
     }
 
-    // offset 0 = latest, offset 1 = one before, ...
+    // offset 0 = latest, offset N = N bars ago
     let idx = ctx.candles.len().checked_sub(operand.offset + 1)?;
 
     // MA columns (ma10, ma30, ma60, …) come from on-demand MA lines
@@ -908,6 +980,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_dl_summary_fields() {
+        // updated line
+        assert_eq!(
+            parse_dl_summary_field("  updated  : 42 (with 1234 new bars)"),
+            Some(("updated", 42))
+        );
+        // skipped line
+        assert_eq!(
+            parse_dl_summary_field("  skipped  : 5015 (already fresh today)"),
+            Some(("skipped", 5015))
+        );
+        // failed line (only shown when > 0)
+        assert_eq!(
+            parse_dl_summary_field("  failed   : 3"),
+            Some(("failed", 3))
+        );
+        // stocks line
+        assert_eq!(
+            parse_dl_summary_field("  stocks   : 5015"),
+            Some(("stocks", 5015))
+        );
+        // data dir line must be ignored (multi-word key, path value)
+        assert_eq!(
+            parse_dl_summary_field("  data dir : /Users/mxiaofeng/Downloads/stock-dl-data/"),
+            None
+        );
+        // "Download complete." header line must not match
+        assert_eq!(parse_dl_summary_field("Download complete."), None);
+    }
+
+    #[test]
     fn parses_legacy_settings_without_removed_fields() {
         // Settings on disk no longer have ma_windows/source/periods/... but
         // must still deserialize cleanly with sensible defaults.
@@ -927,6 +1030,7 @@ mod tests {
             vec![NamedFilter {
                 name: "default".to_string(),
                 filters: vec!["price > ma60".to_string()],
+                periods: vec![Period::Daily],
             }]
         );
         assert_eq!(parsed.ma, vec![10, 30, 60]);
@@ -1134,11 +1238,11 @@ mod tests {
 
         // price > ma10 should hold on a rising series
         let filters = vec![parse_data_filter("price > ma10").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &filters, &ma));
+        assert!(evaluate_filters_on_stock(&dir, &filters, &ma, &[Period::Daily]));
 
         // price < ma10 should not hold
         let filters = vec![parse_data_filter("price < ma10").unwrap()];
-        assert!(!evaluate_filters_on_stock(&dir, &filters, &ma));
+        assert!(!evaluate_filters_on_stock(&dir, &filters, &ma, &[Period::Daily]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1164,7 +1268,7 @@ mod tests {
 
         let configured = vec![10, 30, 60];
         let filters = vec![parse_data_filter("price > ma5").unwrap()];
-        assert!(evaluate_filters_on_stock(&dir, &filters, &configured));
+        assert!(evaluate_filters_on_stock(&dir, &filters, &configured, &[Period::Daily]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1191,7 +1295,7 @@ mod tests {
             parse_data_filter("ma30 >= ma60").unwrap(),
             parse_data_filter("ma60 >= ma120").unwrap(),
         ];
-        assert!(evaluate_filters_on_stock(&dir, &filters, &configured));
+        assert!(evaluate_filters_on_stock(&dir, &filters, &configured, &[Period::Daily]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1215,6 +1319,53 @@ mod tests {
         let (_candles, ma_lines) = load_candles(&dir, Period::Daily, &[5, 10, 20]);
         let periods: Vec<usize> = ma_lines.iter().map(|m| m.period).collect();
         assert_eq!(periods, vec![5, 10, 20]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_division_operand() {
+        let f = parse_data_filter("price/price[200] <= 2.0").unwrap();
+        assert!(matches!(f.operator, FilterOperator::LessThanOrEqual));
+        // numerator: latest close
+        assert_eq!(f.left.column, "close");
+        assert_eq!(f.left.offset, 0);
+        // divisor: close 200 bars ago
+        let div = f.left.divisor.as_ref().unwrap();
+        assert_eq!(div.column, "close");
+        assert_eq!(div.offset, 200);
+        // right side: literal 2.0
+        assert_eq!(f.right.column, "2.0");
+        assert!(f.right.divisor.is_none());
+    }
+
+    #[test]
+    fn filter_division_ratio_passes_and_fails() {
+        let dir = std::env::temp_dir().join("chart_app_filter_div_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 250 rows: closes rise from 1 to 250 (latest = 250, row 200 bars ago = 50)
+        // ratio = 250/50 = 5.0
+        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
+        for i in 1u32..=250 {
+            let date = format!("2025-{:02}-{:02}", (i / 31) + 1, (i % 28) + 1);
+            csv.push_str(&format!(
+                "{date},{v}.0,{v}.0,{v}.0,{v}.0,100,\n",
+                v = i
+            ));
+        }
+        std::fs::write(dir.join("daily.csv"), csv).unwrap();
+
+        let ma = vec![];
+
+        // ratio 5.0 > 2.0 → passes
+        let filters = vec![parse_data_filter("price/price[200] > 2.0").unwrap()];
+        assert!(evaluate_filters_on_stock(&dir, &filters, &ma, &[Period::Daily]));
+
+        // ratio 5.0 <= 2.0 → fails
+        let filters = vec![parse_data_filter("price/price[200] <= 2.0").unwrap()];
+        assert!(!evaluate_filters_on_stock(&dir, &filters, &ma, &[Period::Daily]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
