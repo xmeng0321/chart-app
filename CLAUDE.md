@@ -52,21 +52,42 @@ stock dir/daily.csv → load_candles → (Vec<Candle>, Vec<MaLine>)
 
 ### Filter expressions
 
-Filters live in `settings.json` under `data_filters` as `NamedFilter` objects:
+Filters live in `settings.json` under `data_filters` as `NamedFilter` objects, and
+are created/edited in the app (筛选 tab → 编辑/新建, `FilterEditor` in `main.rs`):
 
 ```json
 {
   "name": "my-filter",
   "periods": ["daily"],
-  "filters": ["ma250 >= ma250[-1]", "price/price[-200] <= 2.0"]
+  "filters": [
+    "week: close > ma100",
+    "day: close > ma120 and (ma60 > ma120 or ma120 > ma120[-1])",
+    "price/price[-200] <= 2.0"
+  ]
 }
 ```
 
-- `periods`: `["daily"]` (default), `["weekly"]`, or `["daily", "weekly"]` (OR logic — stock passes if all conditions hold on any listed period).
+Each entry in `filters` is one line of the editor:
+
+```
+[day:|week:] <bool expr>
+```
+
+- **Lines are ANDed.** Blank lines and `#` / `//` lines are ignored.
+- **Period prefix** (`day`/`daily`/`d`, `week`/`weekly`/`w`) pins that line to one
+  timeframe. Without a prefix the line falls back to the bundle's `periods` and
+  passes if it holds on any of them (`["daily"]` by default).
+- **Boolean operators** `and` / `or` (case-insensitive) with parentheses; `and`
+  binds tighter than `or`.
 - Operand syntax: `column` or `column[N]` (N bars ago; sign ignored). Division via `/`.
 - Supported columns: `close`/`price`, `open`, `high`, `low`, `volume`, `maN` (any period).
-- Operators: `>`, `>=`, `<`, `<=`.
+  Unknown columns are rejected at parse time.
+- Comparison operators: `>`, `>=`, `<`, `<=`.
 - MA periods not in the configured `ma` list are computed on-demand during filter evaluation.
+
+Parsing lives in `data.rs`: `parse_filter_lines` → `parse_filter_line` →
+`parse_filter_expr` (→ `FilterExpr` tree) → `parse_data_filter` for each leaf
+comparison. `evaluate_filters_on_stock` loads candles at most once per timeframe.
 
 ### MA colors (`chart.rs:ma_color`)
 
