@@ -16,6 +16,17 @@ const MODEL_OPTIONS: &[&str] = &[
     "gpt-5.4-mini",
 ];
 
+const FILTER_SYNTAX_HELP: &str = "\
+字段: close (= price), open, high, low, volume, maN (ma10, ma250, ...)
+历史值: close[-1], ma100[-2]  ([N] = N 根之前, 正负号等价)
+比较: >  >=  <  <=   除法: price/price[-200] <= 2.0
+单行内: and / or 与括号, 例如
+    day: close > ma120 and (ma60 > ma120 or ma120 > ma120[-1])
+行首周期: day: / week: (默认 day), 例如
+    week: close > ma100
+    day: close > close[-10]
+多行之间是 and; 空行与 # 开头的行会被忽略";
+
 #[derive(Clone, Copy, PartialEq)]
 enum StockTab {
     All,
@@ -42,6 +53,66 @@ impl StockTab {
     }
 }
 
+/// State of the filter editor dialog (筛选 tab → 编辑 / 新建).
+struct FilterEditor {
+    /// Bundle being edited; `None` when creating a new one.
+    original_name: Option<String>,
+    name: String,
+    /// One condition per line, exactly as the user typed it.
+    text: String,
+    /// Set when a save attempt failed (empty name, duplicate, bad syntax).
+    error: Option<String>,
+    /// 删除 asks once before actually removing the bundle.
+    confirm_delete: bool,
+}
+
+impl FilterEditor {
+    fn new(bundle: Option<&NamedFilter>) -> Self {
+        Self {
+            original_name: bundle.map(|b| b.name.clone()),
+            name: bundle.map(|b| b.name.clone()).unwrap_or_default(),
+            text: bundle.map(|b| b.filters.join("\n")).unwrap_or_default(),
+            error: None,
+            confirm_delete: false,
+        }
+    }
+
+    /// Editor text as stored lines: trailing whitespace and trailing blank
+    /// lines dropped, everything else (including comments) kept verbatim.
+    fn lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .text
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
+    /// Per-line parse errors, recomputed every frame for live feedback.
+    fn issues(&self) -> Vec<String> {
+        self.text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !is_blank_or_comment(l))
+            .filter_map(|(i, l)| {
+                parse_filter_line(l)
+                    .err()
+                    .map(|e| format!("第 {} 行: {}", i + 1, e))
+            })
+            .collect()
+    }
+}
+
+enum EditorAction {
+    None,
+    Save,
+    Delete,
+    Close,
+}
+
 struct ChartApp {
     stocks: Vec<(StockInfo, PathBuf)>,
     search: String,
@@ -66,6 +137,8 @@ struct ChartApp {
     /// Name of the currently picked filter bundle from `settings.data_filters`.
     /// Persisted across launches so the dropdown reopens to the same choice.
     selected_filter_name: Option<String>,
+    /// Open filter editor dialog, if any.
+    filter_editor: Option<FilterEditor>,
     /// Last stock (secid) viewed in each tab. Persisted so a tab switch or
     /// app restart restores the user's position per-tab.
     last_selected_by_tab: HashMap<String, String>,
@@ -131,6 +204,7 @@ impl ChartApp {
             filter_status: FilterStatus::Idle,
             filter_receiver: None,
             selected_filter_name,
+            filter_editor: None,
             last_selected_by_tab,
             scroll_to_selected: false,
             auto_sync_secid: None,
@@ -562,18 +636,17 @@ impl ChartApp {
         let filter_name = bundle.name.clone();
         let filter_periods = bundle.periods.clone();
 
-        let filters: Vec<DataFilter> = match bundle
-            .filters
-            .iter()
-            .map(|s| parse_data_filter(s))
-            .collect::<Result<Vec<_>, _>>()
-        {
+        let filters: Vec<FilterLine> = match parse_filter_lines(&bundle.filters) {
             Ok(f) => f,
             Err(e) => {
                 self.filter_status = FilterStatus::Error(format!("过滤条件解析失败: {}", e));
                 return;
             }
         };
+        if filters.is_empty() {
+            self.filter_status = FilterStatus::Error("该筛选没有任何条件".to_string());
+            return;
+        }
 
         let ma_windows = settings.ma.clone();
         let data_dir = self.resolve_data_dir();
@@ -616,6 +689,248 @@ impl ChartApp {
             let _ = tx.send(FilterMessage::Finished(Ok((matched, total))));
             ctx.request_repaint();
         });
+    }
+
+    fn open_filter_editor(&mut self, name: Option<&str>) {
+        let settings = load_settings();
+        let bundle = name.and_then(|n| settings.data_filters.iter().find(|f| f.name == n));
+        self.filter_editor = Some(FilterEditor::new(bundle));
+    }
+
+    /// The editor dialog. Held outside `self` while drawing so the closure can
+    /// mutate the editor without borrowing the whole app.
+    fn show_filter_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut ed) = self.filter_editor.take() else {
+            return;
+        };
+
+        let mut window_open = true;
+        let mut action = EditorAction::None;
+        let title = if ed.original_name.is_some() {
+            "编辑筛选"
+        } else {
+            "新建筛选"
+        };
+
+        egui::Window::new(title)
+            .open(&mut window_open)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("名称:").size(12.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ed.name)
+                            .desired_width(220.0)
+                            .hint_text("例如 long-term-bullish"),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("条件 (每行一条，行之间是 and):").size(12.0));
+                ui.add(
+                    egui::TextEdit::multiline(&mut ed.text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(10)
+                        .desired_width(f32::INFINITY)
+                        .code_editor()
+                        .hint_text("week: close > ma100\nday: close > close[-10]"),
+                );
+
+                let issues = ed.issues();
+                ui.add_space(4.0);
+                if issues.is_empty() {
+                    let count = ed
+                        .text
+                        .lines()
+                        .filter(|l| !is_blank_or_comment(l))
+                        .count();
+                    ui.label(
+                        egui::RichText::new(format!("✓ {} 个条件", count))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(0x66, 0xBB, 0x6A)),
+                    );
+                } else {
+                    for issue in &issues {
+                        ui.label(
+                            egui::RichText::new(issue)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(0xef, 0x53, 0x50)),
+                        );
+                    }
+                }
+
+                if let Some(err) = &ed.error {
+                    ui.label(
+                        egui::RichText::new(err)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(0xef, 0x53, 0x50)),
+                    );
+                }
+
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new(egui::RichText::new("语法说明").size(12.0))
+                    .id_salt("filter-syntax-help")
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(FILTER_SYNTAX_HELP)
+                                .size(11.0)
+                                .monospace(),
+                        );
+                    });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let can_save = !ed.name.trim().is_empty() && issues.is_empty();
+                    if ui
+                        .add_enabled(
+                            can_save,
+                            egui::Button::new(egui::RichText::new("保存").size(12.0)),
+                        )
+                        .clicked()
+                    {
+                        action = EditorAction::Save;
+                    }
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("取消").size(12.0)))
+                        .clicked()
+                    {
+                        action = EditorAction::Close;
+                    }
+                    if ed.original_name.is_some() {
+                        ui.separator();
+                        let label = if ed.confirm_delete {
+                            "确认删除?"
+                        } else {
+                            "删除"
+                        };
+                        let btn = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new(label)
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(0xef, 0x53, 0x50)),
+                            ),
+                        );
+                        if btn.clicked() {
+                            if ed.confirm_delete {
+                                action = EditorAction::Delete;
+                            } else {
+                                ed.confirm_delete = true;
+                            }
+                        }
+                    }
+                });
+            });
+
+        match action {
+            EditorAction::Save => {
+                if self.save_filter_editor(&mut ed) {
+                    return; // editor closed on success
+                }
+            }
+            EditorAction::Delete => {
+                if let Some(name) = ed.original_name.clone() {
+                    self.delete_filter_bundle(&name);
+                }
+                return;
+            }
+            EditorAction::Close => return,
+            EditorAction::None => {}
+        }
+
+        if window_open {
+            self.filter_editor = Some(ed);
+        }
+    }
+
+    /// Writes the edited bundle back to `settings.json`. Returns true when the
+    /// save went through (the caller then drops the editor).
+    fn save_filter_editor(&mut self, ed: &mut FilterEditor) -> bool {
+        let name = ed.name.trim().to_string();
+        if name.is_empty() {
+            ed.error = Some("请输入筛选名称".to_string());
+            return false;
+        }
+
+        let lines = ed.lines();
+        let parsed = match parse_filter_lines(&lines) {
+            Ok(p) => p,
+            Err(e) => {
+                ed.error = Some(e);
+                return false;
+            }
+        };
+        if parsed.is_empty() {
+            ed.error = Some("至少需要一个条件".to_string());
+            return false;
+        }
+
+        let mut settings = load_settings();
+        let name_taken = settings
+            .data_filters
+            .iter()
+            .any(|f| f.name == name && Some(&f.name) != ed.original_name.as_ref());
+        if name_taken {
+            ed.error = Some(format!("已存在同名筛选: {}", name));
+            return false;
+        }
+
+        let existing = ed
+            .original_name
+            .as_ref()
+            .and_then(|orig| settings.data_filters.iter_mut().find(|f| &f.name == orig));
+        // Editing the conditions invalidates the cached match list: it was
+        // produced by the *old* conditions, and leaving it on screen next to the
+        // new ones is how you end up "explaining" a stock that never matched.
+        let conditions_changed = match existing {
+            Some(f) => {
+                let changed = f.filters != lines;
+                f.name = name.clone();
+                f.filters = lines;
+                changed
+            }
+            None => {
+                settings.data_filters.push(NamedFilter {
+                    name: name.clone(),
+                    filters: lines,
+                    periods: vec![Period::Daily],
+                });
+                true
+            }
+        };
+        save_settings(&settings);
+
+        if let Some(orig) = &ed.original_name {
+            if orig != &name {
+                rename_filtered(orig, &name);
+            }
+        }
+        if conditions_changed {
+            remove_filtered(&name);
+        }
+
+        self.selected_filter_name = Some(name.clone());
+        save_selected_filter(&name);
+        self.reload_filtered_for_selected_filter();
+        self.filter_status = if conditions_changed {
+            FilterStatus::Stale
+        } else {
+            FilterStatus::Idle
+        };
+        true
+    }
+
+    fn delete_filter_bundle(&mut self, name: &str) {
+        let mut settings = load_settings();
+        settings.data_filters.retain(|f| f.name != name);
+        save_settings(&settings);
+        remove_filtered(name);
+
+        self.selected_filter_name = settings.data_filters.first().map(|f| f.name.clone());
+        if let Some(n) = &self.selected_filter_name {
+            save_selected_filter(n);
+        }
+        self.reload_filtered_for_selected_filter();
+        self.filter_status = FilterStatus::Idle;
     }
 
     fn refresh_stock_list(&mut self) {
@@ -905,12 +1220,24 @@ impl eframe::App for ChartApp {
                     // Filter-bundle picker. Reads names from settings on every
                     // frame so edits to settings.json are reflected without a
                     // restart.
-                    let available_filters: Vec<String> = load_settings()
-                        .data_filters
-                        .iter()
-                        .map(|f| f.name.clone())
-                        .collect();
-                    if !available_filters.is_empty() {
+                    let settings = load_settings();
+                    let available_filters: Vec<String> =
+                        settings.data_filters.iter().map(|f| f.name.clone()).collect();
+                    if available_filters.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("尚未配置筛选")
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(0x9E)),
+                            );
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new("新建").size(12.0)))
+                                .clicked()
+                            {
+                                self.open_filter_editor(None);
+                            }
+                        });
+                    } else {
                         // Repair stale selection (e.g. user removed the active
                         // bundle from settings).
                         if !self
@@ -933,6 +1260,7 @@ impl eframe::App for ChartApp {
                                 .unwrap_or_else(|| available_filters[0].clone());
                             ui.add_enabled_ui(!is_filtering, |ui| {
                                 egui::ComboBox::from_id_salt("filter-bundle-select")
+                                    .width(110.0)
                                     .selected_text(egui::RichText::new(&current).size(12.0))
                                     .show_ui(ui, |ui| {
                                         for name in &available_filters {
@@ -944,24 +1272,23 @@ impl eframe::App for ChartApp {
                                         }
                                     });
                             });
-                            // Show which timeframe(s) the active filter runs on.
-                            let period_label = {
-                                let settings = load_settings();
-                                settings
-                                    .data_filters
-                                    .iter()
-                                    .find(|f| Some(&f.name) == self.selected_filter_name.as_ref())
-                                    .map(|f| {
-                                        let has_daily = f.periods.contains(&Period::Daily) || f.periods.is_empty();
-                                        let has_weekly = f.periods.contains(&Period::Weekly);
-                                        match (has_daily, has_weekly) {
-                                            (true, true) => "日+周",
-                                            (false, true) => "周",
-                                            _ => "日",
-                                        }
-                                    })
-                                    .unwrap_or("日")
-                            };
+                            // Show which timeframe(s) the active filter reads,
+                            // derived from the per-line `day:` / `week:` prefixes.
+                            let period_label = settings
+                                .data_filters
+                                .iter()
+                                .find(|f| Some(&f.name) == self.selected_filter_name.as_ref())
+                                .map(|f| {
+                                    let periods = f.active_periods();
+                                    let has_daily = periods.contains(&Period::Daily);
+                                    let has_weekly = periods.contains(&Period::Weekly);
+                                    match (has_daily, has_weekly) {
+                                        (true, true) => "日+周",
+                                        (false, true) => "周",
+                                        _ => "日",
+                                    }
+                                })
+                                .unwrap_or("日");
                             ui.label(
                                 egui::RichText::new(format!("[{period_label}]"))
                                     .size(11.0)
@@ -993,6 +1320,21 @@ impl eframe::App for ChartApp {
                         }
                         if is_filtering {
                             ui.spinner();
+                        }
+                        if !available_filters.is_empty() {
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new("编辑").size(12.0)))
+                                .clicked()
+                            {
+                                let name = self.selected_filter_name.clone();
+                                self.open_filter_editor(name.as_deref());
+                            }
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new("新建").size(12.0)))
+                                .clicked()
+                            {
+                                self.open_filter_editor(None);
+                            }
                         }
                     });
                     match &self.filter_status {
@@ -1033,6 +1375,13 @@ impl eframe::App for ChartApp {
                                 egui::RichText::new(format!("筛选错误: {msg}"))
                                     .size(11.0)
                                     .color(egui::Color32::from_rgb(0xef, 0x53, 0x50)),
+                            );
+                        }
+                        FilterStatus::Stale => {
+                            ui.label(
+                                egui::RichText::new("条件已修改，请点击\"重新筛选\"")
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(0xFF, 0xB7, 0x4D)),
                             );
                         }
                         FilterStatus::Idle => {}
@@ -1121,6 +1470,8 @@ impl eframe::App for ChartApp {
                     }
                 });
             });
+
+        self.show_filter_editor(ctx);
 
         // ── Central panel: chart ──
         egui::CentralPanel::default().show(ctx, |ui| {

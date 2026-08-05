@@ -73,27 +73,55 @@ pub fn load_filtered(filter_name: Option<&str>) -> Vec<String> {
 
 pub fn save_filtered(filter_name: Option<&str>, filtered: &[String]) {
     let path = filtered_path();
-    let key = filtered_key(filter_name);
-    let mut by_name = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<FilteredStore>(&content).ok())
-        .map(|store| match store {
-            FilteredStore::ByName(by_name) => by_name,
-            FilteredStore::Legacy(filtered) => {
-                let mut by_name = HashMap::new();
-                by_name.insert(key.clone(), filtered);
-                by_name
-            }
-        })
-        .unwrap_or_default();
+    let mut by_name = read_filtered_store(&path).unwrap_or_default();
+    by_name.insert(filtered_key(filter_name), filtered.to_vec());
+    write_filtered_store(&path, &by_name);
+}
 
-    by_name.insert(key, filtered.to_vec());
+/// Drops a bundle's cached results, e.g. after the bundle itself is deleted.
+pub fn remove_filtered(filter_name: &str) {
+    let path = filtered_path();
+    let Some(mut by_name) = read_filtered_store(&path) else {
+        return;
+    };
+    if by_name.remove(&filtered_key(Some(filter_name))).is_some() {
+        write_filtered_store(&path, &by_name);
+    }
+}
 
+/// Moves cached results to a new name so a rename doesn't discard the last run.
+pub fn rename_filtered(old_name: &str, new_name: &str) {
+    if old_name == new_name {
+        return;
+    }
+    let path = filtered_path();
+    let Some(mut by_name) = read_filtered_store(&path) else {
+        return;
+    };
+    if let Some(v) = by_name.remove(&filtered_key(Some(old_name))) {
+        by_name.insert(filtered_key(Some(new_name)), v);
+        write_filtered_store(&path, &by_name);
+    }
+}
+
+fn read_filtered_store(path: &Path) -> Option<HashMap<String, Vec<String>>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<FilteredStore>(&content).ok()? {
+        FilteredStore::ByName(by_name) => Some(by_name),
+        FilteredStore::Legacy(filtered) => {
+            let mut by_name = HashMap::new();
+            by_name.insert(DEFAULT_FILTER_KEY.to_string(), filtered);
+            Some(by_name)
+        }
+    }
+}
+
+fn write_filtered_store(path: &Path, by_name: &HashMap<String, Vec<String>>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_string_pretty(&by_name) {
-        let _ = std::fs::write(&path, json);
+    if let Ok(json) = serde_json::to_string_pretty(by_name) {
+        let _ = std::fs::write(path, json);
     }
 }
 
@@ -192,13 +220,12 @@ fn default_filter_periods() -> Vec<Period> {
     vec![Period::Daily]
 }
 
-/// A named bundle of filter expressions. The user picks one of these from a
-/// dropdown in the Filtered tab; all expressions in `filters` must match for a
-/// stock to be included.
+/// A named bundle of filter lines, edited in the Filtered tab and picked from
+/// the dropdown by name. All lines in `filters` must hold for a stock to match.
 ///
-/// `periods` controls which timeframes are evaluated. A stock passes if ALL
-/// conditions hold on ANY of the listed periods. Defaults to `["daily"]`.
-/// Use `["daily", "weekly"]` to match on either timeframe.
+/// Each line may pin its own timeframe with a `day:` / `week:` prefix.
+/// `periods` is the fallback for lines without a prefix: such a line passes if
+/// it holds on any of the listed periods. Defaults to `["daily"]`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct NamedFilter {
     pub name: String,
@@ -206,6 +233,39 @@ pub struct NamedFilter {
     pub filters: Vec<String>,
     #[serde(default = "default_filter_periods")]
     pub periods: Vec<Period>,
+}
+
+impl NamedFilter {
+    /// Timeframes this bundle actually reads, for the `[日]` / `[周]` /
+    /// `[日+周]` badge next to the picker. Unparsable lines are ignored — the
+    /// editor reports those separately.
+    pub fn active_periods(&self) -> Vec<Period> {
+        let defaults = if self.periods.is_empty() {
+            &[Period::Daily][..]
+        } else {
+            &self.periods
+        };
+        let mut out: Vec<Period> = Vec::new();
+        for line in &self.filters {
+            if is_blank_or_comment(line) {
+                continue;
+            }
+            let periods = match parse_filter_line(line) {
+                Ok(l) => l.period.map(|p| vec![p]).unwrap_or_else(|| defaults.to_vec()),
+                Err(_) => continue,
+            };
+            for p in periods {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        if out.is_empty() {
+            defaults.to_vec()
+        } else {
+            out
+        }
+    }
 }
 
 fn default_data_dir() -> String {
@@ -488,7 +548,7 @@ pub struct MaLine {
     pub values: Vec<f64>, // same length as candles; NaN where insufficient data
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Period {
     Daily,
@@ -698,12 +758,58 @@ fn calculate_ma(closes: &[f64], period: usize) -> Vec<f64> {
 }
 
 // ── Data filter types and logic ──
+//
+// A filter bundle is a list of user-editable lines. Each line is
+//
+//     [period ':'] bool_expr
+//
+// where `period` is `day`/`daily` or `week`/`weekly` (omitted ⟹ the bundle's
+// default periods), and `bool_expr` combines comparisons with `and` / `or`
+// (`and` binds tighter) and optional parentheses:
+//
+//     week: close > ma100
+//     day: close > ma120 and (ma60 > ma120 or ma120 > ma120[-1])
+//
+// Lines are ANDed together: a stock matches only if every line holds.
 
 #[derive(Debug, Clone)]
 pub struct DataFilter {
     pub left: FilterOperand,
     pub operator: FilterOperator,
     pub right: FilterOperand,
+    #[allow(dead_code)]
+    pub raw: String,
+}
+
+/// Boolean combination of comparisons within a single filter line.
+#[derive(Debug, Clone)]
+pub enum FilterExpr {
+    Cmp(DataFilter),
+    And(Vec<FilterExpr>),
+    Or(Vec<FilterExpr>),
+}
+
+impl FilterExpr {
+    /// Visits every comparison in the tree (used to collect MA references).
+    fn for_each_cmp(&self, f: &mut impl FnMut(&DataFilter)) {
+        match self {
+            FilterExpr::Cmp(c) => f(c),
+            FilterExpr::And(v) | FilterExpr::Or(v) => {
+                for e in v {
+                    e.for_each_cmp(f);
+                }
+            }
+        }
+    }
+}
+
+/// One line of a filter bundle: an optional timeframe prefix plus the
+/// expression that must hold on that timeframe.
+#[derive(Debug, Clone)]
+pub struct FilterLine {
+    /// `None` ⟹ evaluate on the bundle's configured periods.
+    pub period: Option<Period>,
+    pub expr: FilterExpr,
     #[allow(dead_code)]
     pub raw: String,
 }
@@ -723,6 +829,154 @@ pub enum FilterOperator {
     LessThanOrEqual,
 }
 
+/// Parses the lines of a bundle, skipping blank lines and `#` / `//` comments.
+/// Errors are prefixed with the 1-based line number the user sees in the editor.
+pub fn parse_filter_lines<S: AsRef<str>>(lines: &[S]) -> Result<Vec<FilterLine>, String> {
+    let mut parsed = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if is_blank_or_comment(line.as_ref()) {
+            continue;
+        }
+        match parse_filter_line(line.as_ref()) {
+            Ok(l) => parsed.push(l),
+            Err(e) => return Err(format!("第 {} 行: {}", i + 1, e)),
+        }
+    }
+    Ok(parsed)
+}
+
+pub fn is_blank_or_comment(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty() || t.starts_with('#') || t.starts_with("//")
+}
+
+/// Parses a single line: optional `day:` / `week:` prefix + boolean expression.
+pub fn parse_filter_line(line: &str) -> Result<FilterLine, String> {
+    let raw = line.trim();
+    let (period, body) = split_period_prefix(raw)?;
+    let expr = parse_filter_expr(body)?;
+    Ok(FilterLine {
+        period,
+        expr,
+        raw: raw.to_string(),
+    })
+}
+
+fn split_period_prefix(s: &str) -> Result<(Option<Period>, &str), String> {
+    // Only a leading `<word>:` counts as a prefix; nothing else in the grammar
+    // uses ':' so an unrecognised head is a typo worth reporting.
+    let Some(colon) = s.find(':') else {
+        return Ok((None, s));
+    };
+    let head = s[..colon].trim().to_ascii_lowercase();
+    let rest = &s[colon + 1..];
+    match head.as_str() {
+        "day" | "daily" | "d" => Ok((Some(Period::Daily), rest)),
+        "week" | "weekly" | "w" => Ok((Some(Period::Weekly), rest)),
+        _ => Err(format!(
+            "\":\" 只能用于行首的周期前缀 (day: 或 week:), 这里是 \"{}\"",
+            head
+        )),
+    }
+}
+
+/// `or` has the lowest precedence, then `and`, then a bare comparison.
+pub fn parse_filter_expr(s: &str) -> Result<FilterExpr, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("条件为空".to_string());
+    }
+    if let Some(parts) = split_top_level(s, "or") {
+        return Ok(FilterExpr::Or(parse_all(&parts)?));
+    }
+    if let Some(parts) = split_top_level(s, "and") {
+        return Ok(FilterExpr::And(parse_all(&parts)?));
+    }
+    if let Some(inner) = strip_outer_parens(s)? {
+        return parse_filter_expr(inner);
+    }
+    Ok(FilterExpr::Cmp(parse_data_filter(s)?))
+}
+
+fn parse_all(parts: &[&str]) -> Result<Vec<FilterExpr>, String> {
+    parts.iter().map(|p| parse_filter_expr(p)).collect()
+}
+
+/// Splits on a keyword that appears outside parentheses and on word
+/// boundaries. Returns `None` when the keyword doesn't occur at that level.
+fn split_top_level<'a>(s: &'a str, kw: &str) -> Option<Vec<&'a str>> {
+    let b = s.as_bytes();
+    let k = kw.as_bytes();
+    let mut depth: i32 = 0;
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => {
+                let end = i + k.len();
+                let matches = depth == 0
+                    && end <= b.len()
+                    && b[i..end].eq_ignore_ascii_case(k)
+                    && (i == 0 || !is_word_byte(b[i - 1]))
+                    && (end >= b.len() || !is_word_byte(b[end]));
+                if matches {
+                    parts.push(&s[start..i]);
+                    start = end;
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(&s[start..]);
+    Some(parts)
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `Some(inner)` when the whole expression is wrapped in one pair of parens.
+/// Errors on unbalanced parentheses so typos surface at parse time.
+fn strip_outer_parens(s: &str) -> Result<Option<&str>, String> {
+    let mut depth: i32 = 0;
+    let mut closes_at_end = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(format!("括号不匹配: {}", s));
+                }
+                closes_at_end = depth == 0 && i + 1 == s.len();
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(format!("括号不匹配: {}", s));
+    }
+    if s.starts_with('(') && closes_at_end {
+        Ok(Some(&s[1..s.len() - 1]))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn parse_data_filter(expr: &str) -> Result<DataFilter, String> {
     let (left_str, op, right_str) = if let Some(pos) = expr.find(">=") {
         (&expr[..pos], FilterOperator::GreaterThanOrEqual, &expr[pos + 2..])
@@ -733,7 +987,7 @@ pub fn parse_data_filter(expr: &str) -> Result<DataFilter, String> {
     } else if let Some(pos) = expr.find('<') {
         (&expr[..pos], FilterOperator::LessThan, &expr[pos + 1..])
     } else {
-        return Err(format!("No > or < operator found in filter: {}", expr));
+        return Err(format!("缺少比较运算符 (>, >=, <, <=): {}", expr.trim()));
     };
 
     let left = parse_filter_operand(left_str.trim())?;
@@ -749,7 +1003,7 @@ pub fn parse_data_filter(expr: &str) -> Result<DataFilter, String> {
 
 fn parse_filter_operand(s: &str) -> Result<FilterOperand, String> {
     if s.is_empty() {
-        return Err("Empty filter operand".to_string());
+        return Err("缺少操作数".to_string());
     }
 
     // Support division: "price/price[200]" means current price / price 200 bars ago.
@@ -769,42 +1023,80 @@ fn parse_filter_operand(s: &str) -> Result<FilterOperand, String> {
 }
 
 fn parse_single_operand(s: &str) -> Result<FilterOperand, String> {
+    let s = s.trim();
     if s.is_empty() {
-        return Err("Empty filter operand".to_string());
+        return Err("缺少操作数".to_string());
     }
 
     let (column, offset) = if let Some(bracket_start) = s.find('[') {
         let bracket_end = s
             .find(']')
-            .ok_or_else(|| format!("Missing ] in operand: {}", s))?;
+            .ok_or_else(|| format!("缺少 ]: {}", s))?;
+        if bracket_end < bracket_start || !s[bracket_end + 1..].trim().is_empty() {
+            return Err(format!("无效的操作数: {}", s));
+        }
         let col = s[..bracket_start].trim();
         let offset_str = s[bracket_start + 1..bracket_end].trim();
         let offset_val: i64 = offset_str
             .parse()
-            .map_err(|_| format!("Invalid offset in operand: {}", s))?;
+            .map_err(|_| format!("无效的偏移量: {}", s))?;
         // Accept price[200] (positive = bars ago) and price[-200] (negative = bars ago)
         (col.to_string(), offset_val.unsigned_abs() as usize)
     } else {
         (s.to_string(), 0)
     };
 
+    // Numeric literals (e.g. the `2.0` in `price/price[-200] <= 2.0`) pass
+    // through as-is; everything else must name a column we can resolve.
+    if column.parse::<f64>().is_ok() {
+        return Ok(FilterOperand {
+            column,
+            offset: 0,
+            divisor: None,
+        });
+    }
+
     // Alias "price" → "close"
+    let column = column.to_ascii_lowercase();
     let column = if column == "price" {
         "close".to_string()
     } else {
-        column.to_lowercase()
+        column
     };
+
+    validate_column(&column)?;
 
     Ok(FilterOperand { column, offset, divisor: None })
 }
 
+/// Rejects unknown columns at parse time — otherwise a typo like `clsoe > ma10`
+/// would parse fine and silently match nothing.
+fn validate_column(column: &str) -> Result<(), String> {
+    if matches!(column, "open" | "close" | "high" | "low" | "volume") {
+        return Ok(());
+    }
+    if let Some(rest) = column.strip_prefix("ma") {
+        return match rest.parse::<usize>() {
+            Ok(p) if p > 0 => Ok(()),
+            _ => Err(format!("无效的均线: {} (示例: ma10, ma250)", column)),
+        };
+    }
+    Err(format!(
+        "未知字段: {} (可用: close/price, open, high, low, volume, maN)",
+        column
+    ))
+}
+
+/// A stock matches when every line holds. A line with an explicit `day:` /
+/// `week:` prefix is evaluated on that timeframe; an unprefixed line is
+/// evaluated on `default_periods` and passes if it holds on any of them.
 pub fn evaluate_filters_on_stock(
     stock_dir: &Path,
-    filters: &[DataFilter],
+    lines: &[FilterLine],
     ma_windows: &[usize],
-    periods: &[Period],
+    default_periods: &[Period],
 ) -> bool {
-    if filters.is_empty() {
+    if lines.is_empty() {
         return true;
     }
 
@@ -812,88 +1104,92 @@ pub fn evaluate_filters_on_stock(
     // expressions like `ma120 > ma240` resolve even if those periods aren't
     // in the user's chart config.
     let mut windows: Vec<usize> = ma_windows.to_vec();
-    for f in filters {
-        for operand in [&f.left, &f.right] {
-            let cols: &[&str] = &[
-                operand.column.as_str(),
-                operand.divisor.as_deref().map(|d| d.column.as_str()).unwrap_or(""),
-            ];
-            for col in cols.iter().filter(|c| !c.is_empty()) {
-                if let Some(p) = col.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
-                    if !windows.contains(&p) {
-                        windows.push(p);
+    for line in lines {
+        line.expr.for_each_cmp(&mut |f| {
+            for operand in [&f.left, &f.right] {
+                for op in [Some(operand), operand.divisor.as_deref()].into_iter().flatten() {
+                    if let Some(p) = op
+                        .column
+                        .strip_prefix("ma")
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        if !windows.contains(&p) {
+                            windows.push(p);
+                        }
                     }
                 }
             }
-        }
+        });
     }
 
-    let eval_periods: &[Period] = if periods.is_empty() {
+    let defaults: &[Period] = if default_periods.is_empty() {
         &[Period::Daily]
     } else {
-        periods
+        default_periods
     };
 
-    for &period in eval_periods {
-        if evaluate_filters_for_period(stock_dir, filters, ma_windows, &windows, period) {
-            return true;
-        }
-    }
-    false
-}
+    // Candles are loaded at most once per timeframe and shared across lines.
+    let mut cache: HashMap<Period, (Vec<Candle>, Vec<MaLine>)> = HashMap::new();
 
-fn evaluate_filters_for_period(
-    stock_dir: &Path,
-    filters: &[DataFilter],
-    _ma_windows: &[usize],
-    windows: &[usize],
-    period: Period,
-) -> bool {
-    let (candles, ma_lines) = load_candles(stock_dir, period, windows);
-    if candles.is_empty() {
-        return false;
-    }
-
-    let max_offset = filters
-        .iter()
-        .flat_map(|f| {
-            let mut offsets = vec![f.left.offset, f.right.offset];
-            if let Some(d) = &f.left.divisor { offsets.push(d.offset); }
-            if let Some(d) = &f.right.divisor { offsets.push(d.offset); }
-            offsets
-        })
-        .max()
-        .unwrap_or(0);
-    if candles.len() <= max_offset {
-        return false;
-    }
-
-    let ctx = FilterContext {
-        candles: &candles,
-        ma_lines: &ma_lines,
-    };
-
-    for filter in filters {
-        let left_val = resolve_operand_value(&ctx, &filter.left);
-        let right_val = resolve_operand_value(&ctx, &filter.right);
-
-        let (Some(lv), Some(rv)) = (left_val, right_val) else {
-            return false;
+    for line in lines {
+        let pass = match line.period {
+            Some(p) => eval_line_on_period(stock_dir, &mut cache, &windows, &line.expr, p),
+            None => defaults
+                .iter()
+                .any(|&p| eval_line_on_period(stock_dir, &mut cache, &windows, &line.expr, p)),
         };
-
-        let pass = match filter.operator {
-            FilterOperator::GreaterThan => lv > rv,
-            FilterOperator::GreaterThanOrEqual => lv >= rv,
-            FilterOperator::LessThan => lv < rv,
-            FilterOperator::LessThanOrEqual => lv <= rv,
-        };
-
         if !pass {
             return false;
         }
     }
-
     true
+}
+
+fn eval_line_on_period(
+    stock_dir: &Path,
+    cache: &mut HashMap<Period, (Vec<Candle>, Vec<MaLine>)>,
+    windows: &[usize],
+    expr: &FilterExpr,
+    period: Period,
+) -> bool {
+    let (candles, ma_lines) = cache
+        .entry(period)
+        .or_insert_with(|| load_candles(stock_dir, period, windows));
+    if candles.is_empty() {
+        return false;
+    }
+    let ctx = FilterContext {
+        candles,
+        ma_lines,
+    };
+    eval_expr(&ctx, expr)
+}
+
+fn eval_expr(ctx: &FilterContext<'_>, expr: &FilterExpr) -> bool {
+    match expr {
+        FilterExpr::Cmp(f) => eval_cmp(ctx, f),
+        FilterExpr::And(v) => v.iter().all(|e| eval_expr(ctx, e)),
+        FilterExpr::Or(v) => v.iter().any(|e| eval_expr(ctx, e)),
+    }
+}
+
+/// A comparison whose operands can't be resolved (not enough history, MA still
+/// warming up) counts as false rather than aborting the whole bundle — that
+/// keeps `or` branches usable on short series.
+fn eval_cmp(ctx: &FilterContext<'_>, filter: &DataFilter) -> bool {
+    let (Some(lv), Some(rv)) = (
+        resolve_operand_value(ctx, &filter.left),
+        resolve_operand_value(ctx, &filter.right),
+    ) else {
+        return false;
+    };
+
+    match filter.operator {
+        FilterOperator::GreaterThan => lv > rv,
+        FilterOperator::GreaterThanOrEqual => lv >= rv,
+        FilterOperator::LessThan => lv < rv,
+        FilterOperator::LessThanOrEqual => lv <= rv,
+    }
 }
 
 struct FilterContext<'a> {
@@ -951,6 +1247,9 @@ fn resolve_single_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Opt
 #[derive(Clone)]
 pub enum FilterStatus {
     Idle,
+    /// Conditions were edited since the last run, so the cached match list was
+    /// dropped — the tab must not show results that predate the edit.
+    Stale,
     Running {
         progress_pct: f32,
         completed: usize,
@@ -978,6 +1277,184 @@ pub enum FilterMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parses editor-style lines, panicking on syntax errors.
+    fn filter_lines(exprs: &[&str]) -> Vec<FilterLine> {
+        parse_filter_lines(exprs).unwrap()
+    }
+
+    /// Writes `daily.csv` with the given closes (o/h/l/c all equal) into a
+    /// fresh temp dir named after the test.
+    fn stock_dir_with_closes(name: &str, closes: &[f64]) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
+        for (i, v) in closes.iter().enumerate() {
+            // Sequential calendar days starting 2025-01-01, so weekly
+            // aggregation sees real week boundaries.
+            let day = i as u32;
+            let (m, d) = (day / 28 + 1, day % 28 + 1);
+            csv.push_str(&format!("2025-{m:02}-{d:02},{v},{v},{v},{v},100,\n"));
+        }
+        std::fs::write(dir.join("daily.csv"), csv).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parses_period_prefix() {
+        let l = parse_filter_line("week: close > ma100").unwrap();
+        assert_eq!(l.period, Some(Period::Weekly));
+        let l = parse_filter_line("day: close > close[-10]").unwrap();
+        assert_eq!(l.period, Some(Period::Daily));
+        // Aliases and casing
+        assert_eq!(
+            parse_filter_line("WEEKLY: close > ma5").unwrap().period,
+            Some(Period::Weekly)
+        );
+        // No prefix ⟹ bundle default
+        assert_eq!(parse_filter_line("close > ma5").unwrap().period, None);
+        // Unknown prefix is an error, not a silently ignored line
+        assert!(parse_filter_line("month: close > ma5").is_err());
+    }
+
+    #[test]
+    fn parses_and_or_with_precedence() {
+        // `and` binds tighter: a or (b and c)
+        let expr = parse_filter_expr("close > ma5 or ma5 > ma10 and ma10 > ma20").unwrap();
+        let FilterExpr::Or(branches) = expr else {
+            panic!("expected Or at the top level");
+        };
+        assert_eq!(branches.len(), 2);
+        assert!(matches!(branches[0], FilterExpr::Cmp(_)));
+        let FilterExpr::And(inner) = &branches[1] else {
+            panic!("expected And under Or");
+        };
+        assert_eq!(inner.len(), 2);
+    }
+
+    #[test]
+    fn parentheses_override_precedence() {
+        let expr = parse_filter_expr("(close > ma5 or ma5 > ma10) and ma10 > ma20").unwrap();
+        let FilterExpr::And(branches) = expr else {
+            panic!("expected And at the top level");
+        };
+        assert!(matches!(branches[0], FilterExpr::Or(_)));
+
+        // Unbalanced parens are rejected rather than silently mis-parsed.
+        assert!(parse_filter_expr("(close > ma5").is_err());
+        assert!(parse_filter_expr("close > ma5)").is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_columns_and_operators() {
+        assert!(parse_filter_expr("clsoe > ma10").is_err());
+        assert!(parse_filter_expr("ma0 > ma10").is_err());
+        assert!(parse_filter_expr("close ma10").is_err());
+        assert!(parse_filter_expr("close > ").is_err());
+        // Keyword-lookalikes inside identifiers must not split the expression
+        assert!(matches!(
+            parse_filter_expr("close > ma10").unwrap(),
+            FilterExpr::Cmp(_)
+        ));
+    }
+
+    #[test]
+    fn skips_blank_and_comment_lines_and_reports_line_numbers() {
+        let lines = vec![
+            "# 长期均线向上".to_string(),
+            String::new(),
+            "close > ma10".to_string(),
+        ];
+        assert_eq!(parse_filter_lines(&lines).unwrap().len(), 1);
+
+        let bad = vec!["close > ma10".to_string(), "bogus > ma10".to_string()];
+        let err = parse_filter_lines(&bad).unwrap_err();
+        assert!(err.starts_with("第 2 行:"), "got: {err}");
+    }
+
+    #[test]
+    fn or_line_matches_when_either_side_holds() {
+        // Rising closes 1..=20: price > ma10 holds, price < ma10 does not.
+        let dir = stock_dir_with_closes(
+            "chart_app_filter_or",
+            &(1..=20).map(|i| i as f64).collect::<Vec<_>>(),
+        );
+        let ma = vec![10];
+
+        let f = filter_lines(&["price < ma10 or price > ma10"]);
+        assert!(evaluate_filters_on_stock(&dir, &f, &ma, &[Period::Daily]));
+
+        let f = filter_lines(&["price < ma10 or ma10 > price"]);
+        assert!(!evaluate_filters_on_stock(&dir, &f, &ma, &[Period::Daily]));
+
+        // `and` still requires both sides
+        let f = filter_lines(&["price > ma10 and price < ma10"]);
+        assert!(!evaluate_filters_on_stock(&dir, &f, &ma, &[Period::Daily]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_line_period_prefix_selects_timeframe() {
+        // 40 daily bars rising 1..=40 ⟹ ~6 weekly bars, also rising.
+        let dir = stock_dir_with_closes(
+            "chart_app_filter_line_period",
+            &(1..=40).map(|i| i as f64).collect::<Vec<_>>(),
+        );
+        let ma = vec![];
+
+        // ma5 exists on daily (40 bars) but not on weekly (6 bars → it does,
+        // barely); use ma20 which only resolves on the daily series.
+        let f = filter_lines(&["day: price > ma20"]);
+        assert!(evaluate_filters_on_stock(&dir, &f, &ma, &[Period::Daily]));
+
+        let f = filter_lines(&["week: price > ma20"]);
+        assert!(!evaluate_filters_on_stock(&dir, &f, &ma, &[Period::Daily]));
+
+        // Mixed timeframes in one bundle: both lines must hold, each on its own.
+        let f = filter_lines(&["week: price > ma3", "day: price > close[-10]"]);
+        assert!(evaluate_filters_on_stock(&dir, &f, &ma, &[Period::Daily]));
+
+        // A prefixed line ignores the bundle's default periods.
+        let f = filter_lines(&["week: price > ma20"]);
+        assert!(!evaluate_filters_on_stock(
+            &dir,
+            &f,
+            &ma,
+            &[Period::Daily, Period::Weekly]
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_periods_reflects_line_prefixes() {
+        let f = NamedFilter {
+            name: "mixed".to_string(),
+            filters: vec![
+                "week: close > ma100".to_string(),
+                "day: close > close[-10]".to_string(),
+            ],
+            periods: vec![Period::Daily],
+        };
+        let p = f.active_periods();
+        assert!(p.contains(&Period::Daily) && p.contains(&Period::Weekly));
+
+        let f = NamedFilter {
+            name: "weekly-only".to_string(),
+            filters: vec!["week: close > ma100".to_string()],
+            periods: vec![Period::Daily],
+        };
+        assert_eq!(f.active_periods(), vec![Period::Weekly]);
+
+        let f = NamedFilter {
+            name: "unprefixed".to_string(),
+            filters: vec!["close > ma100".to_string()],
+            periods: vec![Period::Daily],
+        };
+        assert_eq!(f.active_periods(), vec![Period::Daily]);
+    }
 
     #[test]
     fn parses_dl_summary_fields() {
@@ -1055,9 +1532,9 @@ mod tests {
 
     #[test]
     fn parses_inclusive_filter_operators() {
-        let ge = parse_data_filter("cluster >= 60").unwrap();
+        let ge = parse_data_filter("volume >= 60").unwrap();
         assert!(matches!(ge.operator, FilterOperator::GreaterThanOrEqual));
-        assert_eq!(ge.left.column, "cluster");
+        assert_eq!(ge.left.column, "volume");
         assert_eq!(ge.right.column, "60");
 
         let le = parse_data_filter("price <= ma30").unwrap();
@@ -1237,11 +1714,11 @@ mod tests {
         let ma = vec![10, 30, 60];
 
         // price > ma10 should hold on a rising series
-        let filters = vec![parse_data_filter("price > ma10").unwrap()];
+        let filters = filter_lines(&["price > ma10"]);
         assert!(evaluate_filters_on_stock(&dir, &filters, &ma, &[Period::Daily]));
 
         // price < ma10 should not hold
-        let filters = vec![parse_data_filter("price < ma10").unwrap()];
+        let filters = filter_lines(&["price < ma10"]);
         assert!(!evaluate_filters_on_stock(&dir, &filters, &ma, &[Period::Daily]));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1267,7 +1744,7 @@ mod tests {
         std::fs::write(dir.join("daily.csv"), csv).unwrap();
 
         let configured = vec![10, 30, 60];
-        let filters = vec![parse_data_filter("price > ma5").unwrap()];
+        let filters = filter_lines(&["price > ma5"]);
         assert!(evaluate_filters_on_stock(&dir, &filters, &configured, &[Period::Daily]));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1290,11 +1767,7 @@ mod tests {
         std::fs::write(dir.join("daily.csv"), csv).unwrap();
 
         let configured = vec![10, 30, 60];
-        let filters = vec![
-            parse_data_filter("price >= ma30").unwrap(),
-            parse_data_filter("ma30 >= ma60").unwrap(),
-            parse_data_filter("ma60 >= ma120").unwrap(),
-        ];
+        let filters = filter_lines(&["price >= ma30", "ma30 >= ma60", "ma60 >= ma120"]);
         assert!(evaluate_filters_on_stock(&dir, &filters, &configured, &[Period::Daily]));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1360,11 +1833,11 @@ mod tests {
         let ma = vec![];
 
         // ratio 5.0 > 2.0 → passes
-        let filters = vec![parse_data_filter("price/price[200] > 2.0").unwrap()];
+        let filters = filter_lines(&["price/price[200] > 2.0"]);
         assert!(evaluate_filters_on_stock(&dir, &filters, &ma, &[Period::Daily]));
 
         // ratio 5.0 <= 2.0 → fails
-        let filters = vec![parse_data_filter("price/price[200] <= 2.0").unwrap()];
+        let filters = filter_lines(&["price/price[200] <= 2.0"]);
         assert!(!evaluate_filters_on_stock(&dir, &filters, &ma, &[Period::Daily]));
 
         let _ = std::fs::remove_dir_all(&dir);
