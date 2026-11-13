@@ -25,7 +25,14 @@ const FILTER_SYNTAX_HELP: &str = "\
 行首周期: day: / week: (默认 day), 例如
     week: close > ma100
     day: close > close[-10]
-多行之间是 and; 空行与 # 开头的行会被忽略";
+多行之间是 and; 空行与 # 开头的行会被忽略
+越振越强 (一段上涨后震荡, 回调的底部沿弧线逐步抬高, 至今有效):
+    arc_lows  抬高的底部个数 (至少 3)    arc_len   起涨低点至今的K线数
+    arc_run   起涨那一段的涨幅%          arc_amp   典型回调幅度%
+    arc_lift  底部累计抬高%              arc_bend  弧线弯曲度 (0=直线, 越大越弯)
+    arc_break 现价相对震荡区最高点% (负=仍在区间内)
+    同一行里的 arc_* 指同一段走势, 多个条件请用 and 写在一行, 例如
+    arc_lows >= 4 and arc_len >= 40 and arc_break <= 3";
 
 #[derive(Clone, Copy, PartialEq)]
 enum StockTab {
