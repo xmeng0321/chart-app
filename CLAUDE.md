@@ -22,7 +22,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Three source files — no modules beyond that:
 
-- **`src/data.rs`** — all data types, I/O, and business logic: settings/persistence, candle loading, MA calculation, filter parsing and evaluation, stock-dl output parsing.
+- **`src/data.rs`** — all data types, I/O, and business logic: settings/persistence, candle loading, MA calculation, arc-structure detection (`arc_*`), filter parsing and evaluation, stock-dl output parsing.
 - **`src/chart.rs`** — stateless rendering of the K-line chart. Takes `&[Candle]`, `&[MaLine]`, and `&mut ChartState`; draws via `egui::Painter`. No data loading.
 - **`src/main.rs`** — the `eframe::App` impl (`ChartApp`). Owns all UI state and drives background threads via `mpsc` channels for sync (`run_sync`), filter (`run_filter`), auto-sync (`try_start_auto_sync`), and trade-agent (`run_trade_agent`).
 
@@ -80,14 +80,64 @@ Each entry in `filters` is one line of the editor:
 - **Boolean operators** `and` / `or` (case-insensitive) with parentheses; `and`
   binds tighter than `or`.
 - Operand syntax: `column` or `column[N]` (N bars ago; sign ignored). Division via `/`.
-- Supported columns: `close`/`price`, `open`, `high`, `low`, `volume`, `maN` (any period).
-  Unknown columns are rejected at parse time.
+- Supported columns: `close`/`price`, `open`, `high`, `low`, `volume`, `maN` (any period),
+  and the `arc_*` columns below. Unknown columns are rejected at parse time.
 - Comparison operators: `>`, `>=`, `<`, `<=`.
 - MA periods not in the configured `ma` list are computed on-demand during filter evaluation.
 
 Parsing lives in `data.rs`: `parse_filter_lines` → `parse_filter_line` →
 `parse_filter_expr` (→ `FilterExpr` tree) → `parse_data_filter` for each leaf
-comparison. `evaluate_filters_on_stock` loads candles at most once per timeframe.
+comparison. `evaluate_filters_on_stock` reads each stock's CSV once (weekly is
+aggregated from the daily candles in memory) and checks lines without `arc_*`
+first, so arc detection only runs on stocks that survive the cheap lines.
+
+### Arc structures (越振越强, `arc_*` columns)
+
+The shape: a leg up (a sharp rally, a string of small rebounds, or just one
+hammer candle), then a sideways fight in which each pullback bottoms higher
+than the last — the bottoms trace a rising, convex arc while the tops stay in a
+band. It has no fixed period, so `find_arc_structures` works from swing pivots:
+
+- Closes are reduced to a zigzag at each threshold in `ARC_SCALES` (4%–32%), and
+  each pivot is moved to the true high/low of its swing (shadows count). Only
+  the last `ARC_MAX_BARS` bars are searched.
+- Every swing low is tried as the start of the rally. `arc_from` keeps the
+  stretch from there to the latest bar when: nothing later undercuts the start;
+  the 3–8 bottoms after the rally are mostly rising (one exception per three,
+  never the latest); a parabola fitted through them is not concave and fits
+  tightly; pullbacks retrace at least half of each advance; the tops stay in a
+  band; the bottoms are spread out and the last one is recent; and price has
+  neither fallen through the rising floor nor run far past the band.
+- All tolerances (`ARC_*` constants) are fractions of the structure's own
+  typical pullback, so the rules are scale-free. They were calibrated on three
+  hand-drawn examples, kept as `arc_sketches()` in the tests — if you retune a
+  constant, those tests say whether the reference shapes are still found.
+
+| Column | Meaning |
+|---|---|
+| `arc_lows` | Bottoms (swing lows) made after the rally; at least 3 |
+| `arc_len` | Bars from the rally's starting low to the latest bar |
+| `arc_run` | The rally: starting low → first top, % |
+| `arc_amp` | Typical pullback: median top-to-bottom swing, % |
+| `arc_lift` | How far the bottoms have climbed: last vs first, % |
+| `arc_bend` | Curvature of the arc, % of the lift: 0 = straight, 10–30 = clear arc, slightly negative = flattening |
+| `arc_break` | Latest close vs the highest top of the sideways part, % (negative = still inside the range) |
+
+A stock can hold several structures at once (different scales and starts), so
+`arc_*` columns are bound like a variable: **within one line, on one timeframe,
+every `arc_*` refers to the same structure, and the line holds if any one
+structure satisfies it.** Conditions on one structure therefore go on a single
+line joined with `and`; separate lines may each be met by a different
+structure. With no structure the comparisons are unresolved (false). `arc_*`
+columns take no `[N]` offset.
+
+```
+arc_lows >= 4 and arc_len >= 40 and arc_break <= 3
+```
+
+To scan both timeframes, leave the line unprefixed and set the bundle's
+`periods` to `["daily", "weekly"]` (the editor keeps `periods` but cannot edit
+it; new bundles are created daily-only).
 
 ### MA colors (`chart.rs:ma_color`)
 
