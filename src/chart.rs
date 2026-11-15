@@ -1,4 +1,4 @@
-use crate::data::{Candle, MaLine, TradeAgentResult};
+use crate::data::{ArcStructure, Candle, MaLine, TradeAgentResult};
 use eframe::egui::*;
 
 // TradingView dark theme colors
@@ -11,6 +11,10 @@ const UP_COLOR: Color32 = Color32::from_rgb(0x26, 0xa6, 0x9a);
 const DOWN_COLOR: Color32 = Color32::from_rgb(0xef, 0x53, 0x50);
 const CROSSHAIR_COLOR: Color32 = Color32::from_rgb(0x9b, 0x9e, 0xa8);
 const LABEL_BG: Color32 = Color32::from_rgb(0x36, 0x3a, 0x45);
+// Arc-structure overlay: the arc under the lows, the centre line, the rally.
+const ARC_COLOR: Color32 = Color32::from_rgb(0xff, 0xd5, 0x4f);
+const ARC_CENTRE_COLOR: Color32 = Color32::from_rgb(0x64, 0xb5, 0xf6);
+const ARC_RALLY_COLOR: Color32 = Color32::from_rgb(0xec, 0xef, 0xf1);
 
 const PRICE_AXIS_WIDTH: f32 = 85.0;
 const TIME_AXIS_HEIGHT: f32 = 28.0;
@@ -96,6 +100,9 @@ pub fn ma_color(period: usize) -> Color32 {
 /// `price_level_step` is the fractional gap between consecutive horizontal
 /// price guide lines — e.g. 0.2 for 20 %-per-line on daily charts, 0.3 on
 /// weekly charts.
+///
+/// `arc` is an arc structure found in `candles` (see `data::ArcStructure`) to
+/// mark on the chart, so a stock picked by an `arc_*` filter shows why.
 pub fn draw_chart(
     ui: &mut Ui,
     candles: &[Candle],
@@ -104,6 +111,7 @@ pub fn draw_chart(
     state: &mut ChartState,
     title: &str,
     price_level_step: f64,
+    arc: Option<&ArcStructure>,
 ) {
     if candles.is_empty() {
         ui.centered_and_justified(|ui| {
@@ -170,6 +178,11 @@ pub fn draw_chart(
 
     // Candles
     draw_candles(&clipped, candles, state, &chart_rect);
+
+    // Arc structure (above candles, so its markers stay readable)
+    if let Some(arc) = arc {
+        draw_arc(&clipped, candles, arc, state, &chart_rect);
+    }
 
     // Current price line
     draw_current_price_line(&clipped, candles, state, &chart_rect);
@@ -1146,6 +1159,64 @@ fn draw_price_levels(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
+
+/// Marks an arc structure with its three fitted strokes: the rally (white,
+/// from 起涨 to its top), the centre line of the closes since then (blue,
+/// thin) and the arc under the lows (yellow).
+fn draw_arc(
+    painter: &Painter,
+    candles: &[Candle],
+    arc: &ArcStructure,
+    state: &ChartState,
+    rect: &Rect,
+) {
+    let shape = &arc.shape;
+    // The structure was found in an earlier load of this stock; if the data
+    // has since changed under it, drawing would point at the wrong bars.
+    if shape.end >= candles.len() || !(shape.start < shape.top && shape.top < shape.end) {
+        return;
+    }
+    let at = |bar: f64, price: f64| {
+        pos2(
+            idx_to_x(bar + 0.5, state, rect),
+            price_to_y(price, state, rect),
+        )
+    };
+    let since_top = || (shape.top + 1..=shape.end).map(|i| i as f64);
+
+    // The rally.
+    let start = at(shape.start as f64, candles[shape.start].low);
+    let top = at(shape.top as f64, candles[shape.top].high);
+    painter.line_segment([start, top], Stroke::new(1.5, ARC_RALLY_COLOR));
+    painter.circle_filled(start + vec2(0.0, 8.0), 3.5, ARC_RALLY_COLOR);
+    painter.text(
+        start + vec2(0.0, 14.0),
+        Align2::CENTER_TOP,
+        "起涨",
+        FontId::proportional(11.0),
+        ARC_RALLY_COLOR,
+    );
+
+    // Centre of gravity of the stretch since the top.
+    let centre: Vec<Pos2> = since_top().map(|bar| at(bar, shape.centre_price(bar))).collect();
+    painter.add(Shape::line(centre, Stroke::new(1.0, ARC_CENTRE_COLOR)));
+
+    // The arc under its lows.
+    let bottoms: Vec<Pos2> = since_top().map(|bar| at(bar, shape.arc_price(bar))).collect();
+    painter.add(Shape::line(bottoms, Stroke::new(2.0, ARC_COLOR)));
+
+    // What the strokes add up to.
+    painter.text(
+        pos2(rect.max.x - 10.0, rect.min.y + 8.0),
+        Align2::RIGHT_TOP,
+        format!(
+            "越振越强: 起涨 {:+.0}% (至最高点 {:+.0}%) · 重心抬高 {:+.0}% · 底部抬高 {:+.0}% · 震幅约 {:.0}% · 距高点 {:+.0}%",
+            arc.run, arc.peak, arc.rise, arc.lift, arc.amp, arc.breakout
+        ),
+        FontId::proportional(12.0),
+        ARC_COLOR,
+    );
+}
 
 fn draw_dashed_line_h(painter: &Painter, x0: f32, x1: f32, y: f32, color: Color32, width: f32) {
     let dash = 5.0;

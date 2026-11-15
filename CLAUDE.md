@@ -93,47 +93,62 @@ first, so arc detection only runs on stocks that survive the cheap lines.
 
 ### Arc structures (越振越强, `arc_*` columns)
 
-The shape: a leg up (a sharp rally, a string of small rebounds, or just one
-hammer candle), then a sideways fight in which each pullback bottoms higher
-than the last — the bottoms trace a rising, convex arc while the tops stay in a
-band. It has no fixed period, so `find_arc_structures` works from swing pivots:
+Stripped of its candles the shape is two strokes: a steep rally, then a long
+stretch that drifts gently upward — the fight after the rally keeps being
+settled a little higher, and the lows of that stretch trace a rising arc.
+`find_arc_structures` measures exactly that with three least-squares fits and
+no notion of individual swings:
 
-- Closes are reduced to a zigzag at each threshold in `ARC_SCALES` (4%–32%), and
-  each pivot is moved to the true high/low of its swing (shadows count). Only
-  the last `ARC_MAX_BARS` bars are searched.
-- Every swing low is tried as the start of the rally. `arc_from` keeps the
-  stretch from there to the latest bar when: nothing later undercuts the start;
-  the 3–8 bottoms after the rally are mostly rising (one exception per three,
-  never the latest); a parabola fitted through them is not concave and fits
-  tightly; pullbacks retrace at least half of each advance; the tops stay in a
-  band; the bottoms are spread out and the last one is recent; and price has
-  neither fallen through the rising floor nor run far past the band.
-- All tolerances (`ARC_*` constants) are fractions of the structure's own
-  typical pullback, so the rules are scale-free. They were calibrated on three
-  hand-drawn examples, kept as `arc_sketches()` in the tests — if you retune a
-  constant, those tests say whether the reference shapes are still found.
+- **Rally** — every local high is tried as the rally's top. Walking back from
+  it, the rally starts at the lowest low from which the climb is still one
+  direct leg (a long base ending in a spike only counts the spike).
+- **Centre** (震荡重心) — a line through the closes since the top. It must rise,
+  but far less steeply than the rally, start in the upper part of the rally,
+  and keep rising quarter by quarter; the closes must swing across it, with a
+  scatter (`sigma`) that is moderate, small next to the rally, and similar in
+  both halves.
+- **Bottoms** — a parabola under the lows since the top, fitted by asymmetric
+  least squares so it settles on their underside while a stray shadow cannot
+  drag it down. It must rise and accelerate (bend upward — a straight line
+  doesn't qualify), and not be undercut too deeply.
+
+`arc_at` holds the checks. All tolerances (`ARC_*` constants) are fractions of
+the rally's height or of `sigma`, so the rules are the same for any volatility
+and timeframe. They were calibrated on three hand-drawn examples and one real
+one (东航物流, 2023-11 → 2024-04), kept in the tests as `arc_sketches()` and
+`ARC_EXAMPLE` — if you retune a constant, those tests say whether the reference
+shapes are still found.
 
 | Column | Meaning |
 |---|---|
-| `arc_lows` | Bottoms (swing lows) made after the rally; at least 3 |
 | `arc_len` | Bars from the rally's starting low to the latest bar |
-| `arc_run` | The rally: starting low → first top, % |
-| `arc_amp` | Typical pullback: median top-to-bottom swing, % |
-| `arc_lift` | How far the bottoms have climbed: last vs first, % |
-| `arc_bend` | Curvature of the arc, % of the lift: 0 = straight, 10–30 = clear arc, slightly negative = flattening |
-| `arc_break` | Latest close vs the highest top of the sideways part, % (negative = still inside the range) |
+| `arc_run` | The rally: starting low → top, % |
+| `arc_peak` | Starting low → highest high reached since, % (how far the whole move has carried) |
+| `arc_amp` | Typical swing since the top (3 sigma around the centre line), % |
+| `arc_rise` | How far the centre line has risen since the top, % |
+| `arc_lift` | How far the arc under the lows has risen since the top, % |
+| `arc_bend` | Curvature of that arc, % of the lift: at least 10 (accelerating); 20–60 = clear arc |
+| `arc_break` | Latest close vs the highest high since the rally's top, % (always ≤ 0) |
 
-A stock can hold several structures at once (different scales and starts), so
-`arc_*` columns are bound like a variable: **within one line, on one timeframe,
-every `arc_*` refers to the same structure, and the line holds if any one
-structure satisfies it.** Conditions on one structure therefore go on a single
-line joined with `and`; separate lines may each be met by a different
-structure. With no structure the comparisons are unresolved (false). `arc_*`
-columns take no `[N]` offset.
+A stock can hold more than one structure (different rallies), so `arc_*`
+columns are bound like a variable: **within one line, on one timeframe, every
+`arc_*` refers to the same structure, and the line holds if any one structure
+satisfies it.** Conditions on one structure therefore go on a single line
+joined with `and`; separate lines may each be met by a different structure.
+With no structure the comparisons are unresolved (false). `arc_*` columns take
+no `[N]` offset.
 
 ```
-arc_lows >= 4 and arc_len >= 40 and arc_break <= 3
+arc_len >= 40 and arc_peak <= 100 and arc_break >= -10
 ```
+
+In the Filtered tab the chart marks the structure that got the stock picked
+(`chart.rs:draw_arc`): the rally in white from 起涨 to its top, the centre line
+in blue, the arc under the lows in yellow, and a one-line summary top-right;
+the 走势标识 toolbar button hides it. `ChartApp::refresh_arc_overlay` picks it
+with `arc_to_draw` for the timeframe on screen, and selecting a stock there
+switches the chart to the timeframe on which it qualifies
+(`ChartApp::matched_period`).
 
 To scan both timeframes, leave the line unprefixed and set the bundle's
 `periods` to `["daily", "weekly"]` (the editor keeps `periods` but cannot edit

@@ -26,13 +26,14 @@ const FILTER_SYNTAX_HELP: &str = "\
     week: close > ma100
     day: close > close[-10]
 多行之间是 and; 空行与 # 开头的行会被忽略
-越振越强 (一段上涨后震荡, 回调的底部沿弧线逐步抬高, 至今有效):
-    arc_lows  抬高的底部个数 (至少 3)    arc_len   起涨低点至今的K线数
-    arc_run   起涨那一段的涨幅%          arc_amp   典型回调幅度%
-    arc_lift  底部累计抬高%              arc_bend  弧线弯曲度 (0=直线, 越大越弯)
-    arc_break 现价相对震荡区最高点% (负=仍在区间内)
+越振越强 (一段陡直的上涨, 之后震荡的重心缓慢抬高, 底部沿加速的弧线抬升, 至今有效):
+    arc_len   起涨低点至今的K线数        arc_run   起涨那一段的涨幅%
+    arc_peak  起涨低点到之后最高点的涨幅%  arc_amp   典型震荡幅度%
+    arc_rise  震荡重心累计抬高%          arc_lift  底部弧线累计抬高%
+    arc_bend  弧线弯曲度 (至少 10, 越大越弯)
+    arc_break 现价相对起涨以来最高点% (总是 <= 0)
     同一行里的 arc_* 指同一段走势, 多个条件请用 and 写在一行, 例如
-    arc_lows >= 4 and arc_len >= 40 and arc_break <= 3";
+    arc_len >= 40 and arc_peak <= 100 and arc_break >= -10";
 
 #[derive(Clone, Copy, PartialEq)]
 enum StockTab {
@@ -120,6 +121,11 @@ enum EditorAction {
     Close,
 }
 
+/// Everything the arc overlay depends on: the stock, its timeframe and bar
+/// count (a sync appends bars), and the filter bundle in force — `None` outside
+/// the Filtered tab, where nothing is drawn.
+type ArcOverlayKey = (Option<usize>, Period, usize, Option<String>);
+
 struct ChartApp {
     stocks: Vec<(StockInfo, PathBuf)>,
     search: String,
@@ -146,6 +152,13 @@ struct ChartApp {
     selected_filter_name: Option<String>,
     /// Open filter editor dialog, if any.
     filter_editor: Option<FilterEditor>,
+    /// The structure drawn on the chart when the stock on screen was picked
+    /// by an `arc_*` filter, and what it was computed for (see
+    /// `refresh_arc_overlay`).
+    arc_overlay: Option<ArcStructure>,
+    arc_overlay_key: Option<ArcOverlayKey>,
+    /// Toolbar switch for drawing `arc_overlay`.
+    show_arc: bool,
     /// Last stock (secid) viewed in each tab. Persisted so a tab switch or
     /// app restart restores the user's position per-tab.
     last_selected_by_tab: HashMap<String, String>,
@@ -212,6 +225,9 @@ impl ChartApp {
             filter_receiver: None,
             selected_filter_name,
             filter_editor: None,
+            arc_overlay: None,
+            arc_overlay_key: None,
+            show_arc: true,
             last_selected_by_tab,
             scroll_to_selected: false,
             auto_sync_secid: None,
@@ -241,7 +257,42 @@ impl ChartApp {
                 .insert(self.stock_tab.key().to_string(), info.secid.clone());
             save_last_selected(&self.last_selected_by_tab);
         }
+        if let Some(period) = self.matched_period(idx) {
+            self.period = period;
+        }
         self.reload_candles();
+    }
+
+    /// In the Filtered tab, the timeframe on which stock `idx` meets the
+    /// selected bundle, so the chart opens where the match can be seen: the
+    /// timeframe holding the arc structure for `arc_*` bundles (the current
+    /// one if both do), otherwise the bundle's timeframe when it reads only
+    /// one. `None` leaves the chart on the timeframe it is on.
+    fn matched_period(&self, idx: usize) -> Option<Period> {
+        if self.stock_tab != StockTab::Filtered {
+            return None;
+        }
+        let name = self.selected_filter_name.as_ref()?;
+        let settings = load_settings();
+        let bundle = settings.data_filters.iter().find(|f| &f.name == name)?;
+        let lines = parse_filter_lines(&bundle.filters).ok()?;
+        let (_, dir) = self.stocks.get(idx)?;
+
+        let other = match self.period {
+            Period::Daily => Period::Weekly,
+            Period::Weekly => Period::Daily,
+        };
+        let has_arc = |period: Period| {
+            let (candles, ma_lines) = load_candles(dir, period, &self.ma_windows);
+            arc_to_draw(&lines, &bundle.periods, period, &candles, &ma_lines).is_some()
+        };
+        if let Some(period) = [self.period, other].into_iter().find(|&p| has_arc(p)) {
+            return Some(period);
+        }
+        match bundle.active_periods().as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
     }
 
     /// Select the stock the user was last viewing on the current tab, falling
@@ -698,6 +749,25 @@ impl ChartApp {
         });
     }
 
+    /// Keeps `arc_overlay` in step with what is on screen. Cheap to call every
+    /// frame: the structure is only recomputed when the key changes.
+    fn refresh_arc_overlay(&mut self) {
+        let bundle_name = (self.stock_tab == StockTab::Filtered)
+            .then(|| self.selected_filter_name.clone())
+            .flatten();
+        let key: ArcOverlayKey = (self.selected, self.period, self.candles.len(), bundle_name);
+        if self.arc_overlay_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.arc_overlay = key.3.as_ref().and_then(|name| {
+            let settings = load_settings();
+            let bundle = settings.data_filters.iter().find(|f| &f.name == name)?;
+            let lines = parse_filter_lines(&bundle.filters).ok()?;
+            arc_to_draw(&lines, &bundle.periods, self.period, &self.candles, &self.ma_lines)
+        });
+        self.arc_overlay_key = Some(key);
+    }
+
     fn open_filter_editor(&mut self, name: Option<&str>) {
         let settings = load_settings();
         let bundle = name.and_then(|n| settings.data_filters.iter().find(|f| f.name == n));
@@ -905,6 +975,8 @@ impl ChartApp {
             }
         };
         save_settings(&settings);
+        // The conditions may have changed under the same bundle name.
+        self.arc_overlay_key = None;
 
         if let Some(orig) = &ed.original_name {
             if orig != &name {
@@ -1514,6 +1586,14 @@ impl eframe::App for ChartApp {
                     self.reload_candles();
                 }
 
+                // Switch for the arc-structure markers, offered when the
+                // stock on screen has one to show.
+                if self.arc_overlay.is_some() {
+                    ui.separator();
+                    ui.toggle_value(&mut self.show_arc, "走势标识")
+                        .on_hover_text("显示 / 隐藏筛选命中的走势标注");
+                }
+
                 ui.separator();
 
                 // MA toggle buttons
@@ -1584,6 +1664,7 @@ impl eframe::App for ChartApp {
             });
             ui.separator();
 
+            self.refresh_arc_overlay();
             let title = self
                 .selected
                 .map(|i| self.stocks[i].0.name.clone())
@@ -1602,6 +1683,7 @@ impl eframe::App for ChartApp {
                 &mut self.chart_state,
                 &title,
                 price_level_step,
+                self.arc_overlay.as_ref().filter(|_| self.show_arc),
             );
         });
 
