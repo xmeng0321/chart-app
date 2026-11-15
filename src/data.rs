@@ -759,110 +759,163 @@ fn calculate_ma(closes: &[f64], period: usize) -> Vec<f64> {
 
 // ── Arc structures (越振越强, `arc_*` columns) ──
 //
-// The shape: a leg up — anything from a violent rally to a single hammer
-// candle — then a sideways fight in which every pullback bottoms a little
-// higher than the last, the bottoms tracing a rising, convex ("exponential")
-// arc while the tops stay in a band. Buyers step in earlier on each dip.
+// Stripped of its candles the shape is two strokes: a steep rally, then a long
+// stretch that drifts gently upward. The fight that follows the rally keeps
+// being settled a little higher, and the lows of that stretch trace a rising
+// arc. The detector measures exactly that, with three least-squares fits and
+// no notion of individual swings:
 //
-// None of it has a fixed period, so instead of a look-back window the detector
-// works from swing pivots:
+//   rally    a straight stroke from the low it started at to its top
+//   centre   a line through the closes since the top (the "震荡重心")
+//   bottoms  a parabola hugging the underside of the lows since the top
 //
-//   1. Reduce closes to a zigzag that ignores moves smaller than a threshold,
-//      then move each pivot to the true high/low of its swing. Every threshold
-//      in `ARC_SCALES` is tried, so small and large structures are both found.
-//   2. Take each swing low as a possible start. The leg up from it is the
-//      rally; the swing lows after it are the bottoms, and `arc_from` decides
-//      whether they sit on such an arc right up to the latest bar.
+// Every bar that is a local high is tried as the rally's top; the stretch from
+// there to the latest bar must then pass the checks in `arc_at`. Each top that
+// does is one `ArcStructure` — a stock usually has none, sometimes one or two.
+// Filters read them through the `arc_*` columns.
 //
-// Each surviving stretch is one `ArcStructure`; a stock usually has zero to a
-// handful. Filters read them through the `arc_*` columns.
-//
-// The tolerances below are fractions of the structure's own typical pullback
-// (`amp`), which makes them scale-free. They were calibrated on hand-drawn
-// examples of the shape (see `arc_sketches` in the tests) with some margin.
+// Prices are handled as ln(price). Tolerances are fractions of the rally's
+// height or of `sigma`, the scatter of the closes around the centre line, so
+// the same rules hold for any volatility and timeframe. They were calibrated
+// on the shapes kept as `arc_sketches` and `arc_example` in the tests.
 
-/// Zigzag reversal thresholds (fraction of price) the detector tries.
-const ARC_SCALES: [f64; 10] = [0.04, 0.05, 0.063, 0.08, 0.10, 0.125, 0.16, 0.20, 0.25, 0.32];
 /// Only the most recent bars are searched.
 const ARC_MAX_BARS: usize = 500;
-/// Bottoms after the rally: fewer isn't an arc yet, more means the zigzag is
-/// too fine for this structure (a coarser scale will describe it better).
-const ARC_MIN_LOWS: usize = 3;
-const ARC_MAX_LOWS: usize = 8;
-/// The sideways part must last at least this many bars.
+/// The stretch after the rally lasts at least this many bars, and at least
+/// three times as long as the rally — which itself is at most
+/// `ARC_MAX_RALLY_BARS`.
 const ARC_MIN_BARS: usize = 20;
-/// A bottom that undercuts the previous one by less than this still counts as
-/// holding (double bottoms aren't breaks).
-const ARC_SLACK: f64 = 0.2;
-/// The last bottom sits at least this far above the first.
-const ARC_MIN_LIFT: f64 = 0.4;
-/// Curvature floor: 0 is a straight line, negative is a rise that is running
-/// out of steam. Slightly negative still passes — a hand-drawn arc isn't exact.
-const ARC_MIN_BEND: f64 = -0.1;
-/// How far the fitted arc may sink below its own first bottom (a "U" is a
-/// decline followed by a recovery, not an arc).
-const ARC_MAX_SINK: f64 = 0.35;
-/// RMS distance of the bottoms from the fitted arc.
-const ARC_MAX_RMS: f64 = 0.2;
-/// With five or more bottoms one may be ignored when fitting ("偶尔破例"), as
-/// long as it only dips below the arc, and by no more than this.
-const ARC_MAX_UNDERCUT: f64 = 0.5;
-/// Pullbacks give back at least this share of the preceding advance —
-/// otherwise it is a trend with shallow dips, not a fight.
-const ARC_MIN_RETRACE: f64 = 0.5;
-/// Tops stay in a band this wide ("横盘")…
-const ARC_MAX_TOP_SPAN: f64 = 1.2;
-/// …that neither falls by more than this…
-const ARC_MAX_TOP_DROP: f64 = 0.3;
-/// …nor rises faster than the bottoms by more than this (a widening range).
-const ARC_MAX_TOP_LEAD: f64 = 0.25;
-/// The arc must still be in force: the last bottom is at most this many
-/// typical bottom-to-bottom gaps old…
-const ARC_MAX_STALE: f64 = 2.0;
-/// …and price hasn't fallen further than this below where the bottoms'
-/// average rate of climb puts them today.
-const ARC_FLOOR_SLACK: f64 = 0.25;
-/// The rally is the prelude, not the bulk: at most this share of the bars.
-const ARC_MAX_RALLY_SHARE: f64 = 0.4;
-/// Past this far above the band's highest top the breakout has already run.
-const ARC_MAX_BREAK: f64 = 1.0;
+const ARC_MAX_RALLY_BARS: usize = 60;
+/// A rally top is the highest high within this many bars either side (the
+/// first of them, if several bars share it).
+const ARC_TOP_WINDOW: usize = 5;
+/// The rally gains at least 8% (as ln)…
+const ARC_MIN_RALLY: f64 = 0.076_961_041;
+/// …in one direct leg: averaged over its bars, the close has covered at least
+/// this share of the way up. A straight climb scores 0.5; a long base that
+/// ends in a spike scores close to 0, and only the spike counts as the rally.
+const ARC_MIN_RALLY_FILL: f64 = 0.4;
+/// No low since the top gives back more than this share of the rally.
+const ARC_MAX_GIVEBACK: f64 = 0.75;
+/// The centre line starts at least this far up the rally…
+const ARC_MIN_CENTRE_START: f64 = 0.35;
+/// …rises over the whole stretch by this share of the rally's height (it must
+/// rise, but once it has climbed a full rally the breakout has already run)…
+const ARC_CENTRE_RISE: (f64, f64) = (0.05, 1.0);
+/// …and is at least this many times less steep than the rally.
+const ARC_MIN_STEEPER: f64 = 5.5;
+/// Scatter of the closes around the centre line. A typical swing is about
+/// 3 sigma, so this caps swings at 0.75 of the rally's height…
+const ARC_MAX_SCATTER: f64 = 0.25;
+/// …and at 50% in absolute terms (ln 1.5 / 3).
+const ARC_MAX_SCATTER_ABS: f64 = 0.135_155_036;
+/// It is a fight, not a glide: the closes cross the centre line this often.
+const ARC_MIN_CROSSINGS: usize = 3;
+/// The latest close is no further below the centre line than the first of
+/// these (in sigmas; it would be breaking down), nor above it than the second.
+const ARC_LAST_CLOSE: (f64, f64) = (-2.0, 3.5);
+/// "重心不断抬高": cut into quarters, each one's mean close is higher than the
+/// one before; a quarter may fall short by at most this many sigmas.
+const ARC_CENTRE_SLACK: f64 = 0.5;
+/// The swings keep a rhythm: scatter in the second half relative to the first.
+const ARC_HALF_SCATTER: (f64, f64) = (0.4, 2.5);
+/// The bottoms fit is asymmetric least squares: a low above the curve weighs
+/// this much, a low below it `1 -` this much. That settles the curve on the
+/// underside of the lows, while a stray shadow or two cannot drag it down
+/// ("个别例外"). Re-weighted for a fixed number of rounds.
+const ARC_ENVELOPE_WEIGHT: f64 = 0.08;
+const ARC_ENVELOPE_ROUNDS: usize = 12;
+/// The arc under the lows rises by at least this many sigmas…
+const ARC_MIN_LIFT: f64 = 1.0;
+/// …and accelerates: it bends upward, its midpoint hanging below the straight
+/// line between its ends by at least this share of the lift. A straight line
+/// scores 0, so steadily rising lows don't qualify, let alone flattening ones…
+const ARC_MIN_BEND: f64 = 0.10;
+/// …does not sink below its own starting point by more than this many sigmas
+/// (a "U" is a decline followed by a recovery, not an arc)…
+const ARC_MAX_SINK: f64 = 1.25;
+/// …is undercut by no single low by more than this…
+const ARC_MAX_UNDERCUT: f64 = 2.5;
+/// …and the latest low isn't falling out of it by more than this.
+const ARC_LOW_SLACK: f64 = 0.5;
 
-pub const ARC_COLUMNS: [&str; 7] = [
-    "arc_lows", "arc_len", "arc_run", "arc_amp", "arc_lift", "arc_bend", "arc_break",
+pub const ARC_COLUMNS: [&str; 8] = [
+    "arc_len", "arc_run", "arc_peak", "arc_amp", "arc_rise", "arc_lift", "arc_bend", "arc_break",
 ];
 
-/// One rally-then-rising-bottoms structure that is still in force on the
+/// One rally-then-rising-consolidation structure that is still in force on the
 /// latest bar. Percentages are plain price changes (10.0 = +10%).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArcStructure {
-    /// Bottoms (swing lows) made after the rally.
-    pub lows: usize,
     /// Bars from the low the rally started at to the latest bar.
     pub len: usize,
-    /// The rally: starting low to the first top, in %.
+    /// The rally: starting low to its top, in %.
     pub run: f64,
-    /// Typical pullback: median top-to-bottom swing, in %.
+    /// Starting low to the highest high reached since, in % — how far the
+    /// whole move has already carried. Equals `run` until the rally's top is
+    /// exceeded.
+    pub peak: f64,
+    /// Typical swing since the top (3 sigma around the centre line), in %.
     pub amp: f64,
-    /// How far the bottoms have climbed: last bottom vs first, in %.
+    /// How far the centre line has risen since the top, in %.
+    pub rise: f64,
+    /// How far the arc under the lows has risen since the top, in %.
     pub lift: f64,
-    /// Curvature of the arc through the bottoms: how far its midpoint hangs
-    /// below the straight line from first to last bottom, in % of the lift.
-    /// 0 = straight, 10–30 = a clear arc, negative = flattening out.
+    /// Curvature of that arc: how far its midpoint hangs below the straight
+    /// line between its ends, in % of the lift. At least 10 (accelerating);
+    /// 20–60 is a clear arc.
     pub bend: f64,
-    /// Latest close vs the highest top of the sideways part, in %. Negative
-    /// while still inside the range, positive once it has broken out.
+    /// Latest close vs the highest high since the rally's top, in % (≤ 0).
     pub breakout: f64,
+    /// Where the structure sits on the chart, for drawing it.
+    pub shape: ArcShape,
 }
 
-#[derive(Clone, Copy)]
-struct Swing {
-    idx: usize,
-    peak: bool,
+/// The bars and fitted curves of an `ArcStructure`, as indices into the
+/// candles it was found in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArcShape {
+    /// The low the rally started from.
+    pub start: usize,
+    /// The rally's top.
+    pub top: usize,
+    /// The latest bar; the centre line and the arc run from `top + 1` to here.
+    pub end: usize,
+    /// Centre line: ln(price) = .0 + .1 · (bars since the top).
+    centre: (f64, f64),
+    /// Arc under the lows: ln(price) = c0 + c1·x + c2·x², with x running from
+    /// 0 at the top to 1 at the latest bar.
+    arc: [f64; 3],
 }
 
-/// Every arc structure that ends on the last of `candles`.
+impl ArcShape {
+    pub fn centre_price(&self, bar: f64) -> f64 {
+        (self.centre.0 + self.centre.1 * (bar - self.top as f64)).exp()
+    }
+
+    pub fn arc_price(&self, bar: f64) -> f64 {
+        let x = (bar - self.top as f64) / (self.end - self.top) as f64;
+        (self.arc[0] + self.arc[1] * x + self.arc[2] * x * x).exp()
+    }
+}
+
+/// Log prices of the bars being searched, plus running sums that make the
+/// cheap checks O(1) per candidate top.
+struct ArcSeries {
+    high: Vec<f64>,
+    low: Vec<f64>,
+    close: Vec<f64>,
+    /// `sum_close[i]` = sum of `close[..i]`; `sum_bar_close` weights each by its index.
+    sum_close: Vec<f64>,
+    sum_bar_close: Vec<f64>,
+    /// `low_from[i]` = lowest low in `low[i..]`.
+    low_from: Vec<f64>,
+}
+
+/// Every arc structure that ends on the last of `candles`, longest first.
 pub fn find_arc_structures(candles: &[Candle]) -> Vec<ArcStructure> {
-    let recent = &candles[candles.len().saturating_sub(ARC_MAX_BARS)..];
+    let window = candles.len().saturating_sub(ARC_MAX_BARS);
+    let recent = &candles[window..];
     // Forward-adjusted prices can be zero or negative far in the past; work on
     // the stretch after the last such bar, where logs are defined.
     let start = recent
@@ -870,209 +923,170 @@ pub fn find_arc_structures(candles: &[Candle]) -> Vec<ArcStructure> {
         .rposition(|c| !(c.low > 0.0 && c.high > 0.0 && c.close > 0.0))
         .map_or(0, |i| i + 1);
     let recent = &recent[start..];
-    if recent.len() < ARC_MIN_BARS {
+    let first_bar = window + start;
+    let n = recent.len();
+    if n < ARC_MIN_BARS + 4 {
         return Vec::new();
     }
-    let logh: Vec<f64> = recent.iter().map(|c| c.high.ln()).collect();
-    let logl: Vec<f64> = recent.iter().map(|c| c.low.ln()).collect();
-    let logc: Vec<f64> = recent.iter().map(|c| c.close.ln()).collect();
 
-    let mut out = Vec::new();
-    for scale in ARC_SCALES {
-        let pivots = refine_swings(&zigzag(&logc, scale.ln_1p()), &logh, &logl);
-        for s in (0..pivots.len().saturating_sub(1)).rev() {
-            if pivots[s].peak {
-                continue;
-            }
-            if let Some(arc) = arc_from(&logh, &logl, &logc, &pivots[s..]) {
-                // Neighbouring scales often yield the very same pivots.
-                if !out.contains(&arc) {
-                    out.push(arc);
-                }
-            }
-        }
+    let close: Vec<f64> = recent.iter().map(|c| c.close.ln()).collect();
+    let low: Vec<f64> = recent.iter().map(|c| c.low.ln()).collect();
+    let mut sum_close = vec![0.0; n + 1];
+    let mut sum_bar_close = vec![0.0; n + 1];
+    for (i, c) in close.iter().enumerate() {
+        sum_close[i + 1] = sum_close[i] + c;
+        sum_bar_close[i + 1] = sum_bar_close[i] + i as f64 * c;
     }
+    let mut low_from = low.clone();
+    for i in (0..n - 1).rev() {
+        low_from[i] = low_from[i].min(low_from[i + 1]);
+    }
+    let series = ArcSeries {
+        high: recent.iter().map(|c| c.high.ln()).collect(),
+        low,
+        close,
+        sum_close,
+        sum_bar_close,
+        low_from,
+    };
+
+    let last = n - 1;
+    let mut out: Vec<ArcStructure> = (3..=last - ARC_MIN_BARS)
+        .filter(|&top| {
+            let before = top.saturating_sub(ARC_TOP_WINDOW)..top;
+            let after = top + 1..=(top + ARC_TOP_WINDOW).min(last);
+            series.high[before].iter().all(|&h| h < series.high[top])
+                && series.high[after].iter().all(|&h| h <= series.high[top])
+        })
+        .filter_map(|top| arc_at(&series, top))
+        .collect();
+    for arc in &mut out {
+        arc.shape.start += first_bar;
+        arc.shape.top += first_bar;
+        arc.shape.end += first_bar;
+    }
+    out.sort_by(|a, b| b.len.cmp(&a.len));
     out
 }
 
-/// Swing pivots of a log-price series: a pivot is confirmed once price moves
-/// `threshold` away from it. Pivots alternate low/high; the final entry is the
-/// running extreme of the leg in progress, which may still extend.
-fn zigzag(logc: &[f64], threshold: f64) -> Vec<Swing> {
-    let mut pivots = Vec::new();
-    let (mut hi, mut lo) = (0usize, 0usize);
-    let mut ext = 0usize;
-    let mut rising: Option<bool> = None;
-    for (i, &x) in logc.iter().enumerate().skip(1) {
-        match rising {
-            None => {
-                if x > logc[hi] {
-                    hi = i;
-                }
-                if x < logc[lo] {
-                    lo = i;
-                }
-                if x - logc[lo] >= threshold {
-                    pivots.push(Swing { idx: lo, peak: false });
-                    rising = Some(true);
-                    ext = i;
-                } else if logc[hi] - x >= threshold {
-                    pivots.push(Swing { idx: hi, peak: true });
-                    rising = Some(false);
-                    ext = i;
-                }
-            }
-            Some(true) => {
-                if x > logc[ext] {
-                    ext = i;
-                } else if logc[ext] - x >= threshold {
-                    pivots.push(Swing { idx: ext, peak: true });
-                    rising = Some(false);
-                    ext = i;
-                }
-            }
-            Some(false) => {
-                if x < logc[ext] {
-                    ext = i;
-                } else if x - logc[ext] >= threshold {
-                    pivots.push(Swing { idx: ext, peak: false });
-                    rising = Some(true);
-                    ext = i;
-                }
-            }
+/// Judges the structure whose rally tops out at bar `top`: the rally leading
+/// up to it and the stretch from there to the latest bar.
+fn arc_at(s: &ArcSeries, top: usize) -> Option<ArcStructure> {
+    let last = s.close.len() - 1;
+    let len = last - top; // bars since the top
+    let top_high = s.high[top];
+
+    // The rally stroke. Walking back from the top over successively lower
+    // lows, keep the lowest one from which the climb is still one direct leg.
+    let reach = (len / 3).clamp(3, ARC_MAX_RALLY_BARS);
+    let mut start = top - 1;
+    let mut lowest = s.low[start];
+    for i in (top.saturating_sub(reach)..top).rev() {
+        if s.low[i] > lowest {
+            continue;
+        }
+        lowest = s.low[i];
+        let between = top - i - 1; // closes strictly inside the stroke
+        let fill = if between == 0 {
+            1.0
+        } else {
+            let mean_close = (s.sum_close[top] - s.sum_close[i + 1]) / between as f64;
+            (mean_close - s.low[i]) / (top_high - s.low[i])
+        };
+        if fill >= ARC_MIN_RALLY_FILL {
+            start = i;
         }
     }
-    if let Some(up) = rising {
-        pivots.push(Swing { idx: ext, peak: up });
+    let rally_bars = (top - start) as f64;
+    let rally = top_high - s.low[start];
+    if rally < ARC_MIN_RALLY || s.high[start..top].iter().any(|&h| h > top_high) {
+        return None;
     }
-    pivots
-}
+    // The gains are held: giving most of the rally back is a round trip, not
+    // a confirmation of it.
+    if top_high - s.low_from[top + 1] > ARC_MAX_GIVEBACK * rally {
+        return None;
+    }
 
-/// Moves each close-based pivot to the bar with the highest high (lowest low)
-/// of its swing, so shadows count: a bottom is where price actually traded.
-fn refine_swings(pivots: &[Swing], logh: &[f64], logl: &[f64]) -> Vec<Swing> {
-    let last_bar = logh.len() - 1;
-    pivots
+    // Centre of gravity: the least-squares line through the closes since the
+    // top, as `base + slope · t` with t = 1 at the first bar after it.
+    let n = len as f64;
+    let sum_t = n * (n + 1.0) / 2.0;
+    let sum_tt = n * (n + 1.0) * (2.0 * n + 1.0) / 6.0;
+    let sum_y = s.sum_close[last + 1] - s.sum_close[top + 1];
+    let sum_ty = s.sum_bar_close[last + 1] - s.sum_bar_close[top + 1] - top as f64 * sum_y;
+    let slope = (n * sum_ty - sum_t * sum_y) / (n * sum_tt - sum_t * sum_t);
+    let base = (sum_y - slope * sum_t) / n;
+    let rise = slope * n;
+    if rise < ARC_CENTRE_RISE.0 * rally
+        || rise > ARC_CENTRE_RISE.1 * rally
+        || slope * ARC_MIN_STEEPER > rally / rally_bars
+        || base - s.low[start] < ARC_MIN_CENTRE_START * rally
+    {
+        return None;
+    }
+
+    // How the closes sit around that line.
+    let closes = &s.close[top + 1..];
+    let residuals: Vec<f64> = closes
         .iter()
         .enumerate()
-        .map(|(k, p)| {
-            // The swing reaches from just after the previous pivot to just
-            // before the next one.
-            let from = match k {
-                0 => p.idx.saturating_sub(3),
-                _ => (pivots[k - 1].idx + 1).min(p.idx),
-            };
-            let to = match pivots.get(k + 1) {
-                Some(next) => next.idx.saturating_sub(1).max(p.idx),
-                None => last_bar,
-            };
-            let series = if p.peak { logh } else { logl };
-            let mut best = from;
-            for i in from..=to {
-                let better = if p.peak {
-                    series[i] > series[best]
-                } else {
-                    series[i] < series[best]
-                };
-                if better {
-                    best = i;
-                }
-            }
-            Swing { idx: best, peak: p.peak }
-        })
-        .collect()
-}
-
-/// Judges the stretch from `pivots[0]` (a swing low, where the rally starts)
-/// to the latest bar. The final pivot is the leg still in progress.
-fn arc_from(logh: &[f64], logl: &[f64], logc: &[f64], pivots: &[Swing]) -> Option<ArcStructure> {
-    let (running, confirmed) = pivots.split_last()?;
-    if confirmed.len() < 2 {
-        return None;
-    }
-    let last_bar = logc.len() - 1;
-    let last_close = logc[last_bar];
-    let start = confirmed[0].idx;
-    let first_top = confirmed[1].idx;
-
-    let lows: Vec<usize> = confirmed[2..].iter().filter(|p| !p.peak).map(|p| p.idx).collect();
-    let tops: Vec<usize> = confirmed[1..].iter().filter(|p| p.peak).map(|p| p.idx).collect();
-    let n = lows.len();
-    if !(ARC_MIN_LOWS..=ARC_MAX_LOWS).contains(&n) || tops.len() < n {
-        return None;
-    }
-    // The rally's starting low is never revisited.
-    if logl[start + 1..].iter().any(|&l| l < logl[start]) {
-        return None;
-    }
-
-    let y: Vec<f64> = lows.iter().map(|&i| logl[i]).collect();
-    let top_y: Vec<f64> = tops.iter().map(|&i| logh[i]).collect();
-
-    // Each top with the bottom that follows it.
-    let mut pullbacks: Vec<f64> = (0..n).map(|i| top_y[i] - y[i]).collect();
-    let mut retraces: Vec<f64> = (0..n)
-        .map(|i| {
-            let prev_low = if i == 0 { logl[start] } else { y[i - 1] };
-            (top_y[i] - y[i]) / (top_y[i] - prev_low).max(1e-9)
-        })
+        .map(|(i, c)| c - (base + slope * (i + 1) as f64))
         .collect();
-    let amp = median(&mut pullbacks)?;
-    if amp <= 0.0 || median(&mut retraces)? < ARC_MIN_RETRACE {
+    let sigma = scatter(&residuals);
+    if sigma <= 0.0 || sigma > ARC_MAX_SCATTER * rally || sigma > ARC_MAX_SCATTER_ABS {
         return None;
     }
-    let slack = ARC_SLACK * amp;
-
-    // Bottoms are "mostly rising": one exception per three comparisons is
-    // forgiven, but never the latest — that would mean it is breaking now. A
-    // pullback still in progress counts with the low it has reached so far.
-    let mut held = y.clone();
-    if !running.peak {
-        held.push(logl[running.idx]);
-    }
-    let breaks = held.windows(2).filter(|w| w[1] < w[0] - slack).count();
-    if breaks > (held.len() - 1) / 3 || held[held.len() - 1] < held[held.len() - 2] - slack {
-        return None;
-    }
-    if y.iter().any(|&v| v < y[0] - slack) {
-        return None;
-    }
-    let lift = y[n - 1] - y[0];
-    if lift < ARC_MIN_LIFT * amp {
-        return None;
-    }
-
-    // The arc: a parabola through the bottoms, on time scaled to 0..1.
-    if lows.windows(2).any(|w| w[1] <= w[0]) {
-        return None;
-    }
-    let span = (lows[n - 1] - lows[0]) as f64;
-    let x: Vec<f64> = lows.iter().map(|&i| (i - lows[0]) as f64 / span).collect();
-    let mut best: Option<(f64, [f64; 3], f64)> = None; // (cost, coefficients, rms)
-    let droppable = if n >= 5 { 1..n - 1 } else { 0..0 };
-    for dropped in std::iter::once(None).chain(droppable.map(Some)) {
-        let kept = |k: &usize| Some(*k) != dropped;
-        let xs: Vec<f64> = (0..n).filter(kept).map(|k| x[k]).collect();
-        let ys: Vec<f64> = (0..n).filter(kept).map(|k| y[k]).collect();
-        let Some(coef) = fit_parabola(&xs, &ys) else {
-            continue;
-        };
-        let residual = |k: usize| y[k] - (coef[0] + coef[1] * x[k] + coef[2] * x[k] * x[k]);
-        if let Some(d) = dropped {
-            // An exception is a mild dip below the arc, nothing else.
-            let r = residual(d);
-            if r > 0.0 || -r > ARC_MAX_UNDERCUT * amp {
-                continue;
-            }
-        }
-        let sum_sq: f64 = (0..n).filter(kept).map(|k| residual(k).powi(2)).sum();
-        let rms = (sum_sq / xs.len() as f64).sqrt() / amp;
-        let cost = rms + if dropped.is_some() { 0.1 } else { 0.0 };
-        if best.map_or(true, |(c, _, _)| cost < c) {
-            best = Some((cost, coef, rms));
+    let mut sides = residuals.iter().filter(|r| **r != 0.0).map(|r| *r > 0.0);
+    let mut side = sides.next()?;
+    let mut crossings = 0;
+    for next in sides {
+        if next != side {
+            crossings += 1;
+            side = next;
         }
     }
-    let (_, [_, b, c], rms) = best?;
+    let latest = residuals[len - 1] / sigma;
+    if crossings < ARC_MIN_CROSSINGS || latest < ARC_LAST_CLOSE.0 || latest > ARC_LAST_CLOSE.1 {
+        return None;
+    }
+    // The centre keeps rising, quarter by quarter…
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let quarters: Vec<f64> = (0..4)
+        .map(|k| mean(&closes[k * len / 4..(k + 1) * len / 4]))
+        .collect();
+    if quarters.windows(2).any(|q| q[1] - q[0] < -ARC_CENTRE_SLACK * sigma) {
+        return None;
+    }
+    // …and neither half swings much more wildly than the other.
+    let (first_half, second_half) = residuals.split_at(len / 2);
+    let ratio = scatter(second_half) / scatter(first_half).max(1e-12);
+    if ratio < ARC_HALF_SCATTER.0 || ratio > ARC_HALF_SCATTER.1 {
+        return None;
+    }
+
+    // The bottoms: a parabola under the lows, on time scaled so the stretch
+    // runs from x = 0 at the top to x = 1 at the latest bar.
+    let lows = &s.low[top + 1..];
+    let x = |i: usize| (i + 1) as f64 / n;
+    let curve = |c: &[f64; 3], i: usize| c[0] + c[1] * x(i) + c[2] * x(i) * x(i);
+    let mut weights = vec![1.0; len];
+    let mut arc = [0.0; 3];
+    for _ in 0..ARC_ENVELOPE_ROUNDS {
+        arc = fit_parabola((0..len).map(|i| (x(i), lows[i], weights[i])))?;
+        for (i, w) in weights.iter_mut().enumerate() {
+            *w = if lows[i] < curve(&arc, i) {
+                1.0 - ARC_ENVELOPE_WEIGHT
+            } else {
+                ARC_ENVELOPE_WEIGHT
+            };
+        }
+    }
+    let [_, b, c] = arc;
+    let lift = b + c; // rise of the arc from x = 0 to x = 1
+    if lift < ARC_MIN_LIFT * sigma {
+        return None;
+    }
     // Midpoint sag of a parabola below its chord is c/4.
     let bend = (c / 4.0) / lift;
     // Lowest point of the arc relative to where it starts.
@@ -1084,92 +1098,57 @@ fn arc_from(logh: &[f64], logl: &[f64], logc: &[f64], pivots: &[Swing]) -> Optio
     } else {
         0.0
     };
-    if bend < ARC_MIN_BEND || sink > ARC_MAX_SINK * amp || rms > ARC_MAX_RMS {
-        return None;
-    }
-
-    // Tops: a band, neither sliding nor running away from the bottoms.
-    let top_max = top_y.iter().copied().fold(f64::MIN, f64::max);
-    let top_min = top_y.iter().copied().fold(f64::MAX, f64::min);
-    let half = top_y.len() / 2;
-    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-    let top_trend = mean(&top_y[top_y.len() - half..]) - mean(&top_y[..half]);
-    if top_max - top_min > ARC_MAX_TOP_SPAN * amp
-        || top_trend < -ARC_MAX_TOP_DROP * amp
-        || top_trend > lift + ARC_MAX_TOP_LEAD * amp
+    let deepest = (0..len).map(|i| lows[i] - curve(&arc, i)).fold(f64::MAX, f64::min);
+    if bend < ARC_MIN_BEND
+        || sink > ARC_MAX_SINK * sigma
+        || -deepest > ARC_MAX_UNDERCUT * sigma
+        || lows[len - 1] - curve(&arc, len - 1) < -ARC_LOW_SLACK * sigma
     {
         return None;
     }
 
-    // Rhythm: bottoms spread over the structure rather than bunched at one
-    // end, and the last one recent enough that the arc is still the story.
-    let mut gaps: Vec<f64> = lows.windows(2).map(|w| (w[1] - w[0]) as f64).collect();
-    let longest_gap = gaps.iter().copied().fold(0.0, f64::max);
-    if longest_gap > (0.4 + 0.6 / (n - 1) as f64) * span {
-        return None;
-    }
-    let since = (last_bar - lows[n - 1]) as f64;
-    if since > ARC_MAX_STALE * median(&mut gaps)? {
-        return None;
-    }
-    // Where the bottoms' average climb puts them today; price must not have
-    // fallen through it.
-    let floor = y[n - 1] + lift / span * since;
-    let current = if running.peak {
-        last_close
-    } else {
-        last_close.min(held[held.len() - 1])
-    };
-    if current < floor - ARC_FLOOR_SLACK * amp {
-        return None;
-    }
-
-    let len = last_bar - start;
-    if first_top.saturating_sub(start) as f64 > ARC_MAX_RALLY_SHARE * len as f64
-        || last_bar.saturating_sub(first_top) < ARC_MIN_BARS
-        || last_close - top_max > ARC_MAX_BREAK * amp
-    {
-        return None;
-    }
-
+    let highest = s.high[top..].iter().copied().fold(f64::MIN, f64::max);
     let pct = |log_ratio: f64| (log_ratio.exp() - 1.0) * 100.0;
     Some(ArcStructure {
-        lows: n,
-        len,
-        run: pct(logh[first_top] - logl[start]),
-        amp: pct(amp),
+        len: last - start,
+        run: pct(rally),
+        peak: pct(highest - s.low[start]),
+        amp: pct(3.0 * sigma),
+        rise: pct(rise),
         lift: pct(lift),
         bend: bend * 100.0,
-        breakout: pct(last_close - top_max),
+        breakout: pct(s.close[last] - highest),
+        shape: ArcShape {
+            start,
+            top,
+            end: last,
+            centre: (base, slope),
+            arc,
+        },
     })
 }
 
-/// Median of `values` (which it sorts); `None` when empty.
-fn median(values: &mut [f64]) -> Option<f64> {
+/// Root-mean-square distance of `values` from their own mean.
+fn scatter(values: &[f64]) -> f64 {
     if values.is_empty() {
-        return None;
+        return 0.0;
     }
-    values.sort_by(|a, b| a.total_cmp(b));
-    let mid = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
-        (values[mid - 1] + values[mid]) / 2.0
-    } else {
-        values[mid]
-    })
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64).sqrt()
 }
 
-/// Least-squares `y = a + b·x + c·x²`, returned as `[a, b, c]`. `None` when
-/// the points don't determine a parabola (fewer than three distinct `x`).
-fn fit_parabola(xs: &[f64], ys: &[f64]) -> Option<[f64; 3]> {
+/// Weighted least-squares `y = a + b·x + c·x²` over `(x, y, weight)` points,
+/// returned as `[a, b, c]`. `None` when the points don't determine a parabola.
+fn fit_parabola(points: impl Iterator<Item = (f64, f64, f64)>) -> Option<[f64; 3]> {
     // Normal equations, solved by Gaussian elimination with partial pivoting.
     let mut m = [[0.0f64; 4]; 3];
-    for (&x, &y) in xs.iter().zip(ys) {
+    for (x, y, w) in points {
         let powers = [1.0, x, x * x];
         for r in 0..3 {
             for c in 0..3 {
-                m[r][c] += powers[r] * powers[c];
+                m[r][c] += w * powers[r] * powers[c];
             }
-            m[r][3] += powers[r] * y;
+            m[r][3] += w * powers[r] * y;
         }
     }
     for col in 0..3 {
@@ -1613,6 +1592,43 @@ pub fn evaluate_filters_on_stock(
     })
 }
 
+/// The arc structure to draw on a chart of `period` for a stock this bundle
+/// matched: one that satisfies the bundle's `arc_*` lines on that timeframe,
+/// preferring the longest. `None` when the bundle has
+/// no `arc_*` line for this timeframe or nothing qualifies there (the stock
+/// may have matched on the other timeframe, or the data has changed since).
+pub fn arc_to_draw(
+    lines: &[FilterLine],
+    default_periods: &[Period],
+    period: Period,
+    candles: &[Candle],
+    ma_lines: &[MaLine],
+) -> Option<ArcStructure> {
+    let defaults: &[Period] = if default_periods.is_empty() {
+        &[Period::Daily]
+    } else {
+        default_periods
+    };
+    let arc_lines: Vec<&FilterLine> = lines
+        .iter()
+        .filter(|l| l.expr.uses_arc())
+        .filter(|l| l.period.map_or(defaults.contains(&period), |p| p == period))
+        .collect();
+    if arc_lines.is_empty() || candles.is_empty() {
+        return None;
+    }
+    let satisfied = |arc: &ArcStructure| {
+        let ctx = FilterContext { candles, ma_lines, arc: Some(arc) };
+        arc_lines.iter().filter(|l| eval_expr(&ctx, &l.expr)).count()
+    };
+    find_arc_structures(candles)
+        .into_iter()
+        .map(|arc| (satisfied(&arc), arc))
+        .filter(|(n, _)| *n > 0)
+        .max_by_key(|(n, arc)| (*n, arc.len))
+        .map(|(_, arc)| arc)
+}
+
 /// One stock's candles and arc structures, each computed at most once per
 /// timeframe and shared across lines.
 struct StockData<'a> {
@@ -1720,10 +1736,11 @@ fn resolve_single_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Opt
     if is_arc_column(&operand.column) {
         let arc = ctx.arc?;
         return match operand.column.as_str() {
-            "arc_lows" => Some(arc.lows as f64),
             "arc_len" => Some(arc.len as f64),
             "arc_run" => Some(arc.run),
+            "arc_peak" => Some(arc.peak),
             "arc_amp" => Some(arc.amp),
+            "arc_rise" => Some(arc.rise),
             "arc_lift" => Some(arc.lift),
             "arc_bend" => Some(arc.bend),
             "arc_break" => Some(arc.breakout),
@@ -2413,6 +2430,107 @@ mod tests {
         candles
     }
 
+    /// A sketch from scratch: a flat start at `base`, then the given turning
+    /// points (pixel heights, alternating top / bottom) 60 px apart.
+    fn swing_sketch(base: f64, turns: &[f64]) -> Vec<(f64, f64)> {
+        let mut pts = vec![(0.0, base), (20.0, base)];
+        pts.extend(turns.iter().enumerate().map(|(i, &y)| (80.0 + 60.0 * i as f64, y)));
+        pts
+    }
+
+    /// A real instance of the shape, picked by eye: 东航物流 (sh601156) daily,
+    /// forward-adjusted, as (date, open, high, low, close). A tight base, a
+    /// +40% rally from 2023-11-28 to 2023-12-13, then months of swings whose
+    /// lows rise along an arc — apart from one long lower shadow on 2024-02-05.
+    const ARC_EXAMPLE: &[(&str, f64, f64, f64, f64)] = &[
+        ("2023-10-09", 11.56, 11.57, 11.47, 11.49), ("2023-10-10", 11.5, 11.55, 11.33, 11.33),
+        ("2023-10-11", 11.34, 11.4, 11.29, 11.32), ("2023-10-12", 11.4, 11.44, 11.35, 11.41),
+        ("2023-10-13", 11.37, 11.41, 11.27, 11.3), ("2023-10-16", 11.3, 11.34, 10.97, 11.03),
+        ("2023-10-17", 11.02, 11.04, 10.98, 11.0), ("2023-10-18", 10.99, 11.01, 10.7, 10.74),
+        ("2023-10-19", 10.7, 10.8, 10.66, 10.68), ("2023-10-20", 10.64, 10.73, 10.62, 10.65),
+        ("2023-10-23", 10.62, 10.63, 10.35, 10.4), ("2023-10-24", 10.46, 10.57, 10.39, 10.55),
+        ("2023-10-25", 10.6, 10.69, 10.6, 10.61), ("2023-10-26", 10.59, 10.63, 10.53, 10.62),
+        ("2023-10-27", 10.61, 10.91, 10.57, 10.84), ("2023-10-30", 10.81, 10.93, 10.79, 10.9),
+        ("2023-10-31", 10.85, 10.96, 10.81, 10.88), ("2023-11-01", 10.95, 10.95, 10.79, 10.84),
+        ("2023-11-02", 10.84, 10.89, 10.8, 10.84), ("2023-11-03", 10.88, 10.92, 10.81, 10.89),
+        ("2023-11-06", 10.93, 11.32, 10.93, 11.26), ("2023-11-07", 11.22, 11.35, 11.17, 11.23),
+        ("2023-11-08", 11.23, 11.25, 11.11, 11.16), ("2023-11-09", 11.12, 11.24, 11.12, 11.17),
+        ("2023-11-10", 11.16, 11.25, 11.1, 11.21), ("2023-11-13", 11.21, 11.32, 11.14, 11.32),
+        ("2023-11-14", 11.33, 11.34, 11.22, 11.29), ("2023-11-15", 11.37, 11.41, 11.26, 11.3),
+        ("2023-11-16", 11.32, 11.34, 11.18, 11.25), ("2023-11-17", 11.22, 11.38, 11.2, 11.34),
+        ("2023-11-20", 11.35, 11.42, 11.23, 11.39), ("2023-11-21", 11.4, 11.43, 11.34, 11.36),
+        ("2023-11-22", 11.34, 11.39, 11.24, 11.24), ("2023-11-23", 11.25, 11.31, 11.21, 11.28),
+        ("2023-11-24", 11.29, 11.29, 11.2, 11.26), ("2023-11-27", 11.25, 11.27, 11.16, 11.22),
+        ("2023-11-28", 11.2, 11.28, 11.12, 11.26), ("2023-11-29", 11.26, 11.61, 11.25, 11.5),
+        ("2023-11-30", 11.59, 12.72, 11.51, 12.72), ("2023-12-01", 12.89, 13.82, 12.82, 13.55),
+        ("2023-12-04", 13.79, 14.26, 13.4, 13.4), ("2023-12-05", 13.4, 13.59, 13.12, 13.17),
+        ("2023-12-06", 13.31, 14.03, 13.01, 13.75), ("2023-12-07", 13.75, 14.27, 13.75, 13.93),
+        ("2023-12-08", 13.77, 14.02, 13.52, 13.58), ("2023-12-11", 13.56, 14.6, 13.44, 14.56),
+        ("2023-12-12", 14.6, 15.01, 14.42, 14.8), ("2023-12-13", 14.8, 15.56, 14.75, 15.24),
+        ("2023-12-14", 15.18, 15.55, 14.97, 15.07), ("2023-12-15", 14.88, 15.13, 14.67, 14.83),
+        ("2023-12-18", 14.97, 15.16, 14.67, 14.7), ("2023-12-19", 14.68, 14.74, 13.93, 14.31),
+        ("2023-12-20", 14.47, 14.71, 14.12, 14.2), ("2023-12-21", 14.14, 14.57, 14.02, 14.31),
+        ("2023-12-22", 14.44, 14.44, 14.04, 14.21), ("2023-12-25", 14.12, 14.27, 13.81, 13.9),
+        ("2023-12-26", 13.9, 14.09, 13.52, 13.7), ("2023-12-27", 13.77, 14.34, 13.77, 14.32),
+        ("2023-12-28", 14.27, 14.47, 14.05, 14.09), ("2023-12-29", 14.13, 14.3, 14.01, 14.1),
+        ("2024-01-02", 14.09, 14.41, 13.99, 14.32), ("2024-01-03", 14.18, 14.24, 13.78, 13.92),
+        ("2024-01-04", 13.87, 14.17, 13.81, 14.1), ("2024-01-05", 14.06, 14.13, 13.66, 13.78),
+        ("2024-01-08", 13.71, 13.92, 13.57, 13.62), ("2024-01-09", 13.6, 13.99, 13.52, 13.82),
+        ("2024-01-10", 13.81, 13.9, 13.65, 13.66), ("2024-01-11", 13.68, 14.07, 13.65, 14.01),
+        ("2024-01-12", 14.01, 14.26, 13.86, 13.89), ("2024-01-15", 13.96, 14.57, 13.78, 14.23),
+        ("2024-01-16", 14.24, 15.31, 14.07, 15.21), ("2024-01-17", 15.22, 15.87, 15.02, 15.37),
+        ("2024-01-18", 15.36, 15.39, 14.62, 15.13), ("2024-01-19", 15.12, 15.27, 14.8, 15.16),
+        ("2024-01-22", 15.34, 15.77, 14.62, 14.78), ("2024-01-23", 14.55, 16.07, 14.53, 16.01),
+        ("2024-01-24", 16.17, 16.7, 15.82, 16.6), ("2024-01-25", 16.35, 16.99, 16.16, 16.94),
+        ("2024-01-26", 16.82, 16.85, 16.45, 16.69), ("2024-01-29", 16.32, 16.61, 14.99, 15.17),
+        ("2024-01-30", 15.09, 15.57, 14.98, 15.02), ("2024-01-31", 14.87, 15.24, 14.32, 14.47),
+        ("2024-02-01", 14.39, 14.92, 14.18, 14.65), ("2024-02-02", 14.73, 14.92, 13.65, 14.03),
+        ("2024-02-05", 13.59, 13.99, 12.87, 13.4), ("2024-02-06", 13.12, 14.76, 12.92, 14.7),
+        ("2024-02-07", 14.85, 15.62, 14.57, 15.6), ("2024-02-08", 15.51, 16.28, 15.14, 15.2),
+        ("2024-02-19", 15.63, 16.12, 15.19, 15.81), ("2024-02-20", 15.62, 16.45, 15.49, 16.33),
+        ("2024-02-21", 16.12, 16.77, 16.0, 16.26), ("2024-02-22", 16.15, 16.37, 16.0, 16.22),
+        ("2024-02-23", 16.12, 16.31, 15.92, 15.92), ("2024-02-26", 15.65, 15.9, 15.06, 15.16),
+        ("2024-02-27", 15.17, 15.21, 14.77, 14.99), ("2024-02-28", 14.93, 15.23, 14.72, 14.72),
+        ("2024-02-29", 14.8, 15.04, 14.63, 14.84), ("2024-03-01", 14.83, 14.86, 14.23, 14.72),
+        ("2024-03-04", 14.67, 15.71, 14.51, 15.44), ("2024-03-05", 15.32, 15.37, 14.92, 15.13),
+        ("2024-03-06", 15.04, 15.43, 15.0, 15.19), ("2024-03-07", 15.18, 15.66, 15.07, 15.22),
+        ("2024-03-08", 15.35, 15.62, 15.02, 15.57), ("2024-03-11", 15.32, 15.47, 14.71, 14.84),
+        ("2024-03-12", 14.85, 15.13, 14.77, 14.96), ("2024-03-13", 15.01, 15.36, 14.89, 15.28),
+        ("2024-03-14", 15.28, 15.89, 15.18, 15.43), ("2024-03-15", 15.25, 15.4, 15.12, 15.29),
+        ("2024-03-18", 15.3, 16.11, 15.25, 16.02), ("2024-03-19", 15.9, 15.98, 15.39, 15.51),
+        ("2024-03-20", 15.5, 16.57, 15.43, 16.52), ("2024-03-21", 16.66, 16.68, 15.9, 16.04),
+        ("2024-03-22", 15.94, 15.98, 15.11, 15.2), ("2024-03-25", 15.2, 15.61, 15.02, 15.28),
+        ("2024-03-26", 15.21, 15.37, 14.72, 14.88), ("2024-03-27", 15.22, 16.44, 15.22, 16.03),
+        ("2024-03-28", 16.25, 16.37, 15.73, 15.84), ("2024-03-29", 15.83, 16.89, 15.78, 16.51),
+        ("2024-04-01", 16.54, 17.68, 16.28, 17.61), ("2024-04-02", 17.42, 17.79, 17.33, 17.58),
+        ("2024-04-03", 17.62, 18.0, 17.12, 17.29), ("2024-04-08", 16.82, 16.82, 15.99, 16.42),
+        ("2024-04-09", 16.42, 16.8, 16.32, 16.42), ("2024-04-10", 16.34, 16.73, 16.34, 16.64),
+        ("2024-04-11", 16.62, 16.74, 16.3, 16.4), ("2024-04-12", 16.42, 16.81, 16.42, 16.59),
+        ("2024-04-15", 16.55, 17.4, 16.37, 17.0), ("2024-04-16", 17.18, 17.21, 16.32, 16.34),
+        ("2024-04-17", 16.44, 16.84, 16.22, 16.82), ("2024-04-18", 16.74, 17.06, 16.23, 16.3),
+        ("2024-04-19", 16.24, 16.31, 15.9, 16.1), ("2024-04-22", 16.06, 16.52, 15.98, 16.21),
+        ("2024-04-23", 16.02, 16.22, 15.72, 16.11), ("2024-04-24", 16.94, 17.58, 16.47, 17.5),
+        ("2024-04-25", 17.5, 17.85, 17.43, 17.82), ("2024-04-26", 17.82, 18.15, 17.66, 18.01),
+        ("2024-04-29", 17.94, 18.2, 17.47, 17.81), ("2024-04-30", 16.67, 17.82, 16.67, 17.62),
+    ];
+
+    /// `ARC_EXAMPLE` as candles, up to and including `as_of`.
+    fn arc_example(as_of: &str) -> Vec<Candle> {
+        ARC_EXAMPLE
+            .iter()
+            .filter(|row| row.0 <= as_of)
+            .map(|&(date, open, high, low, close)| Candle {
+                timestamp: date.to_string(),
+                open,
+                close,
+                high,
+                low,
+                volume: 100.0,
+                amount: None,
+            })
+            .collect()
+    }
+
     /// Writes full OHLC candles as `daily.csv` into a fresh temp dir.
     fn stock_dir_with_candles(name: &str, candles: &[Candle]) -> PathBuf {
         let dir = std::env::temp_dir().join(name);
@@ -2429,28 +2547,21 @@ mod tests {
         dir
     }
 
-    /// A sketch from scratch: a flat start at `base`, then the given turning
-    /// points (pixel heights, alternating top / bottom) 60 px apart.
-    fn swing_sketch(base: f64, turns: &[f64]) -> Vec<(f64, f64)> {
-        let mut pts = vec![(0.0, base), (20.0, base)];
-        pts.extend(turns.iter().enumerate().map(|(i, &y)| (80.0 + 60.0 * i as f64, y)));
-        pts
-    }
-
     #[test]
     fn arc_found_on_each_sketch_at_every_stage() {
         // The shape should be recognised while it is still forming, not only
         // once the last swing is in: also try with trailing vertices removed.
         for (i, sketch) in arc_sketches().iter().enumerate() {
-            for cut in 0..4 {
+            // In the first sketch the bottoms climb in a straight line until
+            // the last two swings; only then is there an accelerating arc.
+            let stages = if i == 0 { 0..3 } else { 0..4 };
+            for cut in stages {
                 let candles = candles_from_sketch(&sketch[..sketch.len() - cut]);
-                let arcs = find_arc_structures(&candles);
                 assert!(
-                    arcs.iter().any(|a| a.lows >= 4),
-                    "sketch {} minus {} vertices: {:?}",
+                    !find_arc_structures(&candles).is_empty(),
+                    "sketch {} minus {} vertices",
                     i + 1,
-                    cut,
-                    arcs
+                    cut
                 );
             }
         }
@@ -2458,99 +2569,160 @@ mod tests {
 
     #[test]
     fn arc_metrics_describe_the_sketch() {
-        // Second sketch: a ~35% rally, then six bottoms on ~20% swings that
-        // lift ~19% along a clearly bent arc; price is still inside the range.
+        // Second sketch: a ~36% rally over the first 41 bars, then 174 bars of
+        // ~19% swings whose centre and bottoms both climb about a fifth, the
+        // bottoms along a clearly bent arc.
         let arcs = find_arc_structures(&candles_from_sketch(&arc_sketches()[1]));
-        let a = arcs.iter().find(|a| a.lows == 6).expect("six-bottom structure");
+        assert_eq!(arcs.len(), 1, "{arcs:?}");
+        let a = &arcs[0];
+        assert_eq!((a.shape.start, a.shape.top, a.shape.end), (0, 41, 215));
         assert_eq!(a.len, 215);
-        assert!((a.run - 35.5).abs() < 1.0, "{a:?}");
-        assert!((a.amp - 20.7).abs() < 1.0, "{a:?}");
-        assert!((a.lift - 19.4).abs() < 1.0, "{a:?}");
-        assert!(a.bend > 30.0, "{a:?}");
-        assert!(a.breakout < 0.0, "{a:?}");
+        assert!((a.run - 36.0).abs() < 1.5, "{a:?}");
+        assert!((a.amp - 19.0).abs() < 1.5, "{a:?}");
+        assert!((a.rise - 19.0).abs() < 1.5, "{a:?}");
+        assert!((a.lift - 21.0).abs() < 1.5, "{a:?}");
+        assert!(a.bend > 20.0, "{a:?}");
+        assert!(a.breakout < 0.0 && a.breakout > -10.0, "{a:?}");
+        // The later swings topped out well above the rally's own top: from
+        // the starting low the whole move has carried ~57%.
+        assert!((a.peak - 57.0).abs() < 2.0, "{a:?}");
     }
 
     #[test]
-    fn arc_needs_bottoms_rising_on_an_arc_under_level_tops() {
-        let found = |turns: &[f64]| find_arc_structures(&candles_from_sketch(&swing_sketch(800.0, turns)));
+    fn arc_recognises_the_real_example() {
+        for as_of in ["2024-03-15", "2024-03-29", "2024-04-15", "2024-04-30"] {
+            let candles = arc_example(as_of);
+            let arcs = find_arc_structures(&candles);
+            // Longest first: the structure that starts with the big rally.
+            let a = arcs.first().unwrap_or_else(|| panic!("nothing as of {as_of}"));
+            assert_eq!(candles[a.shape.start].timestamp, "2023-11-28", "as of {as_of}");
+            assert_eq!(candles[a.shape.top].timestamp, "2023-12-13", "as of {as_of}");
+            assert_eq!(a.shape.end, candles.len() - 1);
+            assert!((a.run - 40.0).abs() < 1.0, "{a:?}");
+        }
+        // Three weeks after the 2024-02-05 selloff the lows had not lifted
+        // yet: at that point there was no arc to speak of.
+        assert!(find_arc_structures(&arc_example("2024-02-29")).is_empty());
+    }
 
-        // Bottoms 650 → 640 → 610 → 560 (lower pixel = higher price): each
-        // step up bigger than the last, tops nearly level.
-        let arc = found(&[500.0, 650.0, 490.0, 640.0, 480.0, 610.0, 470.0, 560.0, 460.0]);
-        assert!(arc.iter().any(|a| a.lows == 4 && a.bend > 0.0), "{arc:?}");
-
+    #[test]
+    fn arc_rejects_shapes_that_only_resemble_it() {
+        let found = |turns: &[f64]| {
+            find_arc_structures(&candles_from_sketch(&swing_sketch(800.0, turns))).len()
+        };
+        // Lower pixel = higher price. Bottoms 650 → 640 → 610 → 560 under
+        // nearly level tops: the real thing.
+        assert_eq!(found(&[500.0, 650.0, 490.0, 640.0, 480.0, 610.0, 470.0, 560.0, 460.0]), 1);
+        // Bottoms rising in a straight line (650 → 620 → 590 → 560): higher
+        // every time, but not accelerating.
+        assert_eq!(found(&[500.0, 650.0, 490.0, 620.0, 480.0, 590.0, 470.0, 560.0, 460.0]), 0);
         // The same swings with the bottoms stepping down instead.
-        let falling = found(&[500.0, 560.0, 490.0, 610.0, 480.0, 640.0, 470.0, 650.0, 460.0]);
-        assert!(falling.is_empty(), "{falling:?}");
-
-        // Bottoms that rise fast and then stall (90, 30, 10): losing steam.
-        let fading = found(&[500.0, 650.0, 410.0, 560.0, 380.0, 530.0, 370.0, 520.0, 360.0]);
-        assert!(fading.is_empty(), "{fading:?}");
-
-        // A steep channel: tops climb as fast as the bottoms — a trend, not a
-        // sideways fight.
-        let channel = found(&[500.0, 650.0, 390.0, 540.0, 280.0, 430.0, 170.0, 320.0, 60.0]);
-        assert!(channel.is_empty(), "{channel:?}");
+        assert_eq!(found(&[500.0, 560.0, 490.0, 610.0, 480.0, 640.0, 470.0, 650.0, 460.0]), 0);
+        // Rising at first, then rolling over.
+        assert_eq!(found(&[500.0, 650.0, 440.0, 590.0, 430.0, 600.0, 470.0, 650.0, 520.0]), 0);
+        // A steep channel: every leg up is as big as the "rally" — a trend,
+        // not a rally being digested.
+        assert_eq!(found(&[500.0, 650.0, 390.0, 540.0, 280.0, 430.0, 170.0, 320.0, 60.0]), 0);
+        // A round trip: the rally is given back and price swings near its base.
+        assert_eq!(found(&[500.0, 780.0, 620.0, 770.0, 600.0, 750.0, 580.0, 720.0, 560.0]), 0);
     }
 
     #[test]
-    fn arc_gone_once_price_breaks_the_bottoms() {
+    fn arc_gone_once_price_breaks_down() {
         let mut sketch = arc_sketches()[1].clone();
         sketch.truncate(sketch.len() - 1);
         assert!(!find_arc_structures(&candles_from_sketch(&sketch)).is_empty());
-        // …then a slide back below every bottom since the second.
+        // …then a slide back to where the swings began.
         sketch.push((980.0, 1095.0));
         let arcs = find_arc_structures(&candles_from_sketch(&sketch));
         assert!(arcs.is_empty(), "{arcs:?}");
     }
 
     #[test]
+    fn arc_shape_locates_the_strokes_on_the_chart() {
+        let candles = arc_example("2024-03-29");
+        let lines = filter_lines(&["arc_len >= 40"]);
+        let arc = arc_to_draw(&lines, &[Period::Daily], Period::Daily, &candles, &[])
+            .expect("structure to draw");
+        let shape = &arc.shape;
+        let (first, last) = (shape.top + 1, shape.end);
+
+        // The centre line rises, and runs through the middle of the closes.
+        assert!(shape.centre_price(last as f64) > shape.centre_price(first as f64));
+        let above = (first..=last)
+            .filter(|&i| candles[i].close > shape.centre_price(i as f64))
+            .count();
+        let share = above as f64 / (last - first + 1) as f64;
+        assert!((0.3..=0.7).contains(&share), "{share}");
+
+        // The arc rises too and sits under the centre line. It hugs the lows
+        // from below: only the bottoms of the swings dip under it, a few bars
+        // in all — deepest of them the 2024-02-05 shadow, which it ignores
+        // rather than follows.
+        assert!(shape.arc_price(last as f64) > shape.arc_price(first as f64));
+        assert!(shape.arc_price(last as f64) < shape.centre_price(last as f64));
+        let below: Vec<&str> = (first..=last)
+            .filter(|&i| candles[i].low < shape.arc_price(i as f64) * 0.99)
+            .map(|i| candles[i].timestamp.as_str())
+            .collect();
+        assert!(below.contains(&"2024-02-05"), "{below:?}");
+        assert!(below.len() * 10 <= last - first + 1, "{below:?}");
+        let shadow = candles.iter().position(|c| c.timestamp == "2024-02-05").unwrap();
+        assert!(candles[shadow].low < shape.arc_price(shadow as f64) * 0.95);
+
+        // Nothing to draw where the bundle has no arc line for the timeframe,
+        // where no structure meets it, or for a bundle without `arc_*`.
+        let draw = |line: &str| {
+            arc_to_draw(&filter_lines(&[line]), &[Period::Daily], Period::Daily, &candles, &[])
+        };
+        assert!(draw("week: arc_len >= 40").is_none());
+        assert!(draw("arc_len >= 400").is_none());
+        assert!(draw("close > 0").is_none());
+    }
+
+    #[test]
     fn arc_columns_parse_and_take_no_offset() {
-        assert!(parse_filter_line("arc_lows >= 4 and arc_bend > 0").is_ok());
-        assert!(parse_filter_line("week: arc_break <= 3").is_ok());
-        assert!(parse_filter_line("arc_lows[-1] >= 4").is_err());
+        assert!(parse_filter_line("arc_len >= 40 and arc_peak <= 100").is_ok());
+        assert!(parse_filter_line("week: arc_break >= -10").is_ok());
+        assert!(parse_filter_line("arc_len[-1] >= 40").is_err());
         assert!(parse_filter_line("arc_foo >= 4").is_err());
     }
 
     #[test]
     fn arc_filter_binds_one_structure_per_line() {
-        // The second sketch holds a six-bottom structure 215 bars long and,
-        // from a later starting low, a five-bottom one 166 bars long.
-        let dir = stock_dir_with_candles(
-            "chart_app_arc_filter",
-            &candles_from_sketch(&arc_sketches()[1]),
-        );
+        // By mid-April the example holds two structures: the big one (90 bars
+        // since a +40% rally) and a later one that takes the February rebound
+        // as its rally (42 bars since a +30% one).
+        let dir = stock_dir_with_candles("chart_app_arc_filter", &arc_example("2024-04-15"));
         let ma = vec![];
         let holds = |lines: &[&str], periods: &[Period]| {
             evaluate_filters_on_stock(&dir, &filter_lines(lines), &ma, periods)
         };
         let daily = &[Period::Daily];
 
-        assert!(holds(&["arc_lows >= 6"], daily));
-        assert!(!holds(&["arc_lows >= 7"], daily));
-        assert!(holds(&["arc_lows >= 6 and arc_len >= 200"], daily));
+        assert!(holds(&["arc_len >= 80"], daily));
+        assert!(holds(&["arc_run <= 35"], daily));
+        assert!(!holds(&["arc_len >= 200"], daily));
         // On one line both conditions must be met by the same structure…
-        assert!(!holds(&["arc_lows >= 6 and arc_len <= 200"], daily));
+        assert!(!holds(&["arc_len >= 80 and arc_run <= 35"], daily));
         // …while separate lines may each be met by a different one.
-        assert!(holds(&["arc_lows >= 6", "arc_len <= 200"], daily));
+        assert!(holds(&["arc_len >= 80", "arc_run <= 35"], daily));
 
-
-        // Each timeframe has its own structures: the same shape shows on the
-        // weekly bars, but there it is ~30 bars long, not ~200.
-        assert!(holds(&["week: arc_lows >= 6"], daily));
-        assert!(holds(&["day: arc_len >= 100"], daily));
-        assert!(!holds(&["week: arc_len >= 100"], daily));
+        // Each timeframe has its own structures: 130 daily bars are fewer
+        // than 30 weekly ones, so nothing on the weekly chart is 80 bars long.
+        assert!(holds(&["day: arc_len >= 80"], daily));
+        assert!(!holds(&["week: arc_len >= 80"], daily));
         // An unprefixed line passes if any of the bundle's periods has one.
-        assert!(holds(&["arc_len >= 100"], &[Period::Weekly, Period::Daily]));
-        assert!(!holds(&["arc_len >= 100"], &[Period::Weekly]));
+        assert!(holds(&["arc_len >= 80"], &[Period::Weekly, Period::Daily]));
+        assert!(!holds(&["arc_len >= 80"], &[Period::Weekly]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn arc_columns_are_unresolved_without_a_structure() {
-        // A steady climb has no swings, so there is nothing for `arc_*` to
-        // describe: comparisons are false either way round, not "zero".
+        // A steady climb has no rally-then-pause in it, so there is nothing
+        // for `arc_*` to describe: comparisons are false either way round.
         let closes: Vec<f64> = (1..=120).map(|i| 10.0 + i as f64 * 0.1).collect();
         let dir = stock_dir_with_closes("chart_app_arc_none", &closes);
         let ma = vec![];
@@ -2558,10 +2730,10 @@ mod tests {
             evaluate_filters_on_stock(&dir, &filter_lines(&[line]), &ma, &[Period::Daily])
         };
 
-        assert!(!holds("arc_lows >= 3"));
-        assert!(!holds("arc_lows < 3"));
+        assert!(!holds("arc_len >= 1"));
+        assert!(!holds("arc_len < 1"));
         // …which still lets an `or` branch carry the line.
-        assert!(holds("arc_lows >= 3 or close > ma20"));
+        assert!(holds("arc_len >= 1 or close > ma20"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
