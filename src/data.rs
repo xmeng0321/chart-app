@@ -283,6 +283,87 @@ fn default_data_filters() -> Vec<NamedFilter> {
     Vec::new()
 }
 
+// ── Preset bundles (蓄势待发 / 放量突破 / 下破变脸) ──
+//
+// 蓄势待发 and 放量突破: what a stock looks like shortly before a burst (+30%
+// within 20 sessions) or a sustained run (+50% within 60), as measured over
+// every A-share from 2018 to 2026 — see docs/prelaunch-study.html for the
+// study and the hit rates. In short: such moves rarely come out of a quiet
+// stock. They come from one that is already active and has rallied, has held
+// the upper part of that rally while its volume cooled, and whose volume has
+// just started to return.
+//
+// 下破变脸: the pit structures below (`pit_*`), on either timeframe — a box,
+// a break below it, the floor taken back. It finds a shape and promises
+// nothing: a rough check of its daily picks (every 5th session, 2019–2026)
+// showed no higher rate of bursts than the market and at most a small edge
+// in 20-bar return.
+//
+// All are plain filter lines, so the thresholds can be tuned in the editor.
+
+const PRESET_SETUP: &[&str] = &[
+    "# 蓄势待发: 涨过一波之后在高位整理, 量先缩后回, 还没启动",
+    "# 2018-2026 回测: 入选后 20 日内涨 30% 的比例约为全市场的 2.3 倍, 60 日内走出趋势的比例约 2 倍",
+    "# 长期 (周线): 站在 30 周线之上, 且 30 周线在抬高 —— 排除底部",
+    "week: close > ma30 and ma30 > ma30[-4]",
+    "# 中期: 60 日线向上, 且在 120 日线之上",
+    "day: ma60 > ma60[-20] and ma60 > ma120",
+    "# 股性活跃: 近 60 日平均日振幅 >= 4%",
+    "day: atr60 >= 4",
+    "# 涨过一波: 比半年内最低点高 40% 以上, 半年新高出现在最近 60 日内",
+    "day: close/llv120 >= 1.4 and hhv60 >= hhv120",
+    "# 强势整理: 仍在近 60 日区间的上部 (0 = 最低点, 100 = 最高点)",
+    "day: pos60 >= 60",
+    "# 量能: 整理期间缩量 (60 日均量低于 250 日均量), 最近 5 日开始回升",
+    "day: vma60 < vma250 and vma5 >= vma60",
+    "# 还没启动: 近 5 日涨跌不超过 8%, 当日涨幅小于 5%",
+    "day: close/close[-5] <= 1.08 and close/close[-5] >= 0.92 and close/close[-1] < 1.05",
+];
+
+const PRESET_BREAKOUT: &[&str] = &[
+    "# 放量突破: 整理之后第一根放量大阳线, 创 60 日新高 (启动确认)",
+    "# 2018-2026 回测: 10 日内涨 30% 的比例约为全市场的 3.4 倍, 但假突破多,",
+    "# 入选后 20 日的平均收益并不占优 —— 适合当提醒, 不适合无条件追入",
+    "week: close > ma30 and ma30 > ma30[-4]",
+    "day: ma60 > ma60[-20]",
+    "day: atr60 >= 3.5",
+    "# 当日涨 5% 以上, 成交量是此前 20 日均量的 1.5 倍以上, 最高价创 60 日新高",
+    "day: close/close[-1] >= 1.05 and volume/vma20[-1] >= 1.5 and high >= hhv60",
+    "# 是第一根: 近 5 日累计涨幅不超过 15%",
+    "day: close/close[-5] <= 1.15",
+];
+
+const PRESET_PIT: &[&str] = &[
+    "# 下破变脸: 先横盘震荡, 然后跌破箱底, 之后又收回箱体并继续回升 (企稳走强, 或慢慢震荡向上)",
+    "# 日线或周线任一满足即入选; 箱体长短不限, 各项容差都按箱体自身的长度、高度和波动来衡量",
+    "# 同一行里的 pit_* 指同一段走势, 所以多个条件用 and 写在一行:",
+    "#   pit_box 横盘的K线数   pit_amp 箱体高度%   pit_drop 跌破箱底的深度%   pit_under 收在箱底之下的K线数",
+    "#   pit_len 坑底至今的K线数   pit_up 坑底以来的涨幅%   pit_pos 现价在箱体中的位置 (0 = 箱底, 100 = 箱顶)",
+    "# 下面这行: 至少横盘 30 根, 箱体高度不超过 40%, 坑底在 40 根以内, 还没有涨出箱顶",
+    "# 可选加严: pit_box >= 60 (横盘更久)  pit_amp <= 25 (箱体更窄)  pit_under >= 5 (不是一两天的假摔)  pit_pos <= 50 (刚收回箱底)",
+    "pit_box >= 30 and pit_amp <= 40 and pit_len <= 40 and pit_pos <= 100",
+];
+
+/// Ready-made bundles: offered in the editor's 新建 dialog, and runnable by
+/// name from the command line (`--filter`) without being saved first.
+pub fn preset_filters() -> Vec<NamedFilter> {
+    let daily = default_filter_periods;
+    // An unprefixed line passes on either timeframe.
+    let either = || vec![Period::Daily, Period::Weekly];
+    [
+        ("蓄势待发", PRESET_SETUP, daily()),
+        ("放量突破", PRESET_BREAKOUT, daily()),
+        ("下破变脸", PRESET_PIT, either()),
+    ]
+    .into_iter()
+    .map(|(name, lines, periods)| NamedFilter {
+        name: name.to_string(),
+        filters: lines.iter().map(|l| l.to_string()).collect(),
+        periods,
+    })
+    .collect()
+}
+
 /// Accepts either the new shape (`[{name, filters}, ...]`) or the legacy plain
 /// list of expressions (`["price > ma60", ...]`), in which case it's wrapped as
 /// a single unnamed bundle so old `settings.json` files keep working.
@@ -912,18 +993,22 @@ struct ArcSeries {
     low_from: Vec<f64>,
 }
 
-/// Every arc structure that ends on the last of `candles`, longest first.
-pub fn find_arc_structures(candles: &[Candle]) -> Vec<ArcStructure> {
-    let window = candles.len().saturating_sub(ARC_MAX_BARS);
+/// The last `max_bars` of `candles` that a structure search can take logs of,
+/// and the index of the first of them. Forward-adjusted prices can be zero or
+/// negative far in the past, so the stretch starts after the last such bar.
+fn log_window(candles: &[Candle], max_bars: usize) -> (usize, &[Candle]) {
+    let window = candles.len().saturating_sub(max_bars);
     let recent = &candles[window..];
-    // Forward-adjusted prices can be zero or negative far in the past; work on
-    // the stretch after the last such bar, where logs are defined.
     let start = recent
         .iter()
         .rposition(|c| !(c.low > 0.0 && c.high > 0.0 && c.close > 0.0))
         .map_or(0, |i| i + 1);
-    let recent = &recent[start..];
-    let first_bar = window + start;
+    (window + start, &recent[start..])
+}
+
+/// Every arc structure that ends on the last of `candles`, longest first.
+pub fn find_arc_structures(candles: &[Candle]) -> Vec<ArcStructure> {
+    let (first_bar, recent) = log_window(candles, ARC_MAX_BARS);
     let n = recent.len();
     if n < ARC_MIN_BARS + 4 {
         return Vec::new();
@@ -1169,6 +1254,349 @@ fn fit_parabola(points: impl Iterator<Item = (f64, f64, f64)>) -> Option<[f64; 3
     Some([m[0][3] / m[0][0], m[1][3] / m[1][1], m[2][3] / m[2][2]])
 }
 
+// ── Pit structures (下破变脸, `pit_*` columns) ──
+//
+// Stripped of its candles the shape is three strokes: a long flat stretch
+// (震荡横盘), a drop through its floor (下破), and a climb that takes the floor
+// back (变脸 — 企稳走强, or 慢慢震荡向上). The detector reads it back from the
+// latest bar:
+//
+//   pit    a low that nothing has undercut since
+//   box    the stretch before the drop into the pit whose closes stay inside
+//          one band — its floor is their lowest, its top their highest
+//   turn   a least-squares line through the closes since the pit low
+//
+// Every low not undercut since is tried as the pit. Of the stretches before it
+// that pass the checks in `pit_box`, the most box-like one — the lowest for
+// its length and its noise — is the box. Box and pit are settled by the bars
+// up to the low; each later bar only re-judges the turn (`pit_at`). A stock
+// usually holds no such structure, sometimes one, now and then two (a wide old
+// box around a young narrow one). Filters read them through the `pit_*`
+// columns.
+//
+// Prices are handled as ln(price), and no tolerance is a bar count or a
+// percentage: lengths are shares of the box's length, heights are shares of
+// the box's height or multiples of `sigma`, the typical bar-to-bar move of the
+// closes inside the box. A six-week shelf and a two-year range, a daily and a
+// weekly chart, a bank and a small cap are all judged by the same rules. They
+// were calibrated on contact sheets of real matches and on the shapes kept as
+// `pit_closes` and `PIT_EXAMPLE` in the tests.
+
+/// Only the most recent bars are searched.
+const PIT_MAX_BARS: usize = 500;
+/// A box holds at least this many bars — fewer and the fits have nothing to
+/// stand on…
+const PIT_MIN_BOX: usize = 20;
+/// …and the pit low is at least this many bars old.
+const PIT_MIN_TURN: usize = 3;
+/// 横盘: the box is low for its length — at most this many times
+/// `sigma · √bars`. A random walk covers about 1.6 of those in the same time,
+/// so the closes must have been going back and forth rather than anywhere.
+const PIT_MAX_TIGHT: f64 = 0.85;
+/// Its centre, a parabola through the closes, is level: end to end it changes
+/// by at most this share of the box's height…
+const PIT_MAX_TILT: f64 = 0.35;
+/// …and it does not arch: its middle stands at most this share above its ends.
+/// A rally given back whole is a mountain, not a box. (Sagging is fine.)
+const PIT_MAX_ARCH: f64 = 0.5;
+/// 震荡: the closes travel between the bottom third and the top third of the
+/// box at least this many times.
+const PIT_MIN_SWINGS: usize = 3;
+/// 下破: the pit low is below the floor by at least this share of the box's
+/// height…
+const PIT_MIN_DEPTH: f64 = 0.3;
+/// …and by at least this many sigmas, more than a few ordinary bars could do.
+const PIT_MIN_DEPTH_NOISE: f64 = 3.0;
+/// From the end of the box to the pit low the closes stay down: none gets
+/// further above the floor than this share of the box's height. (Coming back
+/// up to the broken floor and failing there is part of the drop.)
+const PIT_RETEST: f64 = 0.15;
+/// The drop is short next to the box: end of the box to pit low takes at most
+/// this share of the box's length…
+const PIT_MAX_FALL: f64 = 1.0 / 3.0;
+/// …and the turn is still news: the pit low is at most this share of the
+/// box's length ago.
+const PIT_MAX_TURN: f64 = 0.5;
+/// 变脸: the latest close is back at or above the floor, the line through the
+/// closes since the low has climbed at least this share of the pit's depth…
+const PIT_MIN_RISE: f64 = 0.5;
+/// …and the latest close keeps at least this share of the rebound, from the
+/// pit low to the highest close since.
+const PIT_MIN_HOLD: f64 = 0.5;
+
+pub const PIT_COLUMNS: [&str; 7] = [
+    "pit_box", "pit_amp", "pit_drop", "pit_under", "pit_len", "pit_up", "pit_pos",
+];
+
+/// One box → breakdown → turn structure that is in force on the latest bar.
+/// Percentages are plain price changes (10.0 = 10%).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PitStructure {
+    /// Bars in the box.
+    pub box_len: usize,
+    /// Height of the box: its floor to its top, in %.
+    pub amp: f64,
+    /// Depth of the pit: how far the pit low is below the floor, in % (> 0).
+    pub drop: f64,
+    /// Bars since the box that closed below its floor.
+    pub under: usize,
+    /// Bars since the pit low.
+    pub len: usize,
+    /// The rebound: pit low to the latest close, in %.
+    pub up: f64,
+    /// Where the latest close sits in the box: 0 = floor, 100 = top, more
+    /// once it has left through the top.
+    pub pos: f64,
+    /// Where the structure sits on the chart, for drawing it.
+    pub shape: PitShape,
+}
+
+/// The bars and levels of a `PitStructure`, as indices into the candles it
+/// was found in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PitShape {
+    /// First and last bar of the box.
+    pub start: usize,
+    pub box_end: usize,
+    /// The pit low.
+    pub low: usize,
+    /// The latest bar; the turn line runs from `low` to here.
+    pub end: usize,
+    /// The box's edges: its lowest and its highest close.
+    pub floor: f64,
+    pub top: f64,
+    /// Turn line: ln(price) = .0 + .1 · (bars since the pit low).
+    turn: (f64, f64),
+}
+
+impl PitShape {
+    pub fn turn_price(&self, bar: f64) -> f64 {
+        (self.turn.0 + self.turn.1 * (bar - self.low as f64)).exp()
+    }
+}
+
+/// Every pit structure in force on the last of `candles`, longest box first.
+pub fn find_pit_structures(candles: &[Candle]) -> Vec<PitStructure> {
+    let (first_bar, recent) = log_window(candles, PIT_MAX_BARS);
+    let n = recent.len();
+    if n < PIT_MIN_BOX + PIT_MIN_TURN + 2 {
+        return Vec::new();
+    }
+    let low: Vec<f64> = recent.iter().map(|c| c.low.ln()).collect();
+    let close: Vec<f64> = recent.iter().map(|c| c.close.ln()).collect();
+    let last = n - 1;
+    // `low_after[i]` = lowest low after bar i.
+    let mut low_after = vec![f64::INFINITY; n];
+    for i in (0..last).rev() {
+        low_after[i] = low_after[i + 1].min(low[i + 1]);
+    }
+
+    let mut out: Vec<PitStructure> = (PIT_MIN_BOX..=last - PIT_MIN_TURN)
+        // A pit is the lowest point around: nothing since has undercut it, and
+        // neither do the bars just before it (the box, if any, is above).
+        .filter(|&pit| {
+            low[pit] < low_after[pit] && low[pit - PIT_MIN_BOX..pit].iter().all(|&l| l >= low[pit])
+        })
+        .filter_map(|pit| pit_at(&low, &close, pit))
+        .collect();
+    for pit in &mut out {
+        pit.shape.start += first_bar;
+        pit.shape.box_end += first_bar;
+        pit.shape.low += first_bar;
+        pit.shape.end += first_bar;
+    }
+    out.sort_by(|a, b| b.box_len.cmp(&a.box_len).then(a.shape.low.cmp(&b.shape.low)));
+    out
+}
+
+/// Judges the structure whose pit low is bar `pit`: the turn from there to the
+/// latest bar, against the box found before it. `low` and `close` are logs.
+fn pit_at(low: &[f64], close: &[f64], pit: usize) -> Option<PitStructure> {
+    let last = close.len() - 1;
+    let bars = last - pit; // bars since the low
+    let pit_low = low[pit];
+    let latest = close[last];
+    let since = &close[pit..];
+
+    // The turn: the least-squares line through the closes since the low, as
+    // `base + slope · t` with t = 0 at the low.
+    let (mut sum_y, mut sum_ty) = (0.0, 0.0);
+    for (t, c) in since.iter().enumerate() {
+        sum_y += c;
+        sum_ty += t as f64 * c;
+    }
+    let (t_max, k) = (bars as f64, (bars + 1) as f64);
+    let sum_t = t_max * k / 2.0;
+    let sum_tt = t_max * k * (2.0 * t_max + 1.0) / 6.0;
+    let slope = (k * sum_ty - sum_t * sum_y) / (k * sum_tt - sum_t * sum_t);
+    let base = (sum_y - slope * sum_t) / k;
+    // Still rising, not a bounce already being given back.
+    let highest = since.iter().copied().fold(f64::MIN, f64::max);
+    if highest <= pit_low || latest - pit_low < PIT_MIN_HOLD * (highest - pit_low) {
+        return None;
+    }
+
+    let found = pit_box(low, close, pit)?;
+    let box_len = found.end - found.start + 1;
+    let height = found.top - found.floor;
+    let depth = found.floor - pit_low;
+    // A real breakdown closes below the floor; a shadow through it is not one.
+    let under = close[found.end + 1..].iter().filter(|&&c| c < found.floor).count();
+    if under == 0
+        || bars as f64 > PIT_MAX_TURN * box_len as f64
+        || latest < found.floor
+        || slope * t_max < PIT_MIN_RISE * depth
+    {
+        return None;
+    }
+
+    let pct = |log_ratio: f64| (log_ratio.exp() - 1.0) * 100.0;
+    let (floor, top) = (found.floor.exp(), found.top.exp());
+    Some(PitStructure {
+        box_len,
+        amp: pct(height),
+        drop: -pct(-depth),
+        under,
+        len: bars,
+        up: pct(latest - pit_low),
+        pos: (latest.exp() - floor) / (top - floor) * 100.0,
+        shape: PitShape {
+            start: found.start,
+            box_end: found.end,
+            low: pit,
+            end: last,
+            floor,
+            top,
+            turn: (base, slope),
+        },
+    })
+}
+
+/// A candidate box: bars `start..=end`, with the lowest and highest (log)
+/// close among them, and how tall that is for its length and noise.
+struct PitBox {
+    start: usize,
+    end: usize,
+    floor: f64,
+    top: f64,
+    tight: f64,
+}
+
+/// The box that bar `pit` is a pit under: of all stretches before it that
+/// qualify, the tightest. `low` and `close` are logs.
+fn pit_box(low: &[f64], close: &[f64], pit: usize) -> Option<PitBox> {
+    let pit_low = low[pit];
+    let mut best: Option<PitBox> = None;
+    // Highest close of the drop: of the bars after the box, up to the pit low.
+    let mut drop_high = f64::MIN;
+    for end in (PIT_MIN_BOX - 1..pit).rev() {
+        let fall = (pit - end) as f64;
+        if (end + 1) as f64 * PIT_MAX_FALL < fall {
+            break; // no box ending here or earlier is long enough for this drop
+        }
+        drop_high = drop_high.max(close[end + 1]);
+        // The box ends on the last close that stands above the whole drop.
+        if close[end] <= drop_high {
+            continue;
+        }
+
+        // Grow the box backwards from `end` for as long as its bars stay
+        // above the pit low, noting every length at which it qualifies.
+        let (mut floor, mut top) = (close[end], close[end]);
+        // Highest close after the lowest one: has the floor held before?
+        let mut top_since_floor = f64::MIN;
+        let mut moves = 0.0; // sum of squared bar-to-bar moves
+        let mut candidates: Vec<PitBox> = Vec::new();
+        for start in (0..=end).rev() {
+            let c = close[start];
+            if low[start] <= pit_low {
+                break;
+            }
+            if c < floor {
+                top_since_floor = top;
+                floor = c;
+            }
+            top = top.max(c);
+            if start < end {
+                let step = close[start + 1] - c;
+                moves += step * step;
+            }
+            let height = top - floor;
+            let depth = floor - pit_low;
+            if height * PIT_MIN_DEPTH > depth {
+                break; // from here on the box only gets taller and the pit shallower
+            }
+            let bars = (end - start + 1) as f64;
+            if end - start + 1 < PIT_MIN_BOX || bars * PIT_MAX_FALL < fall || moves <= 0.0 {
+                continue;
+            }
+            let sigma = (moves / (bars - 1.0)).sqrt();
+            let tight = height / (sigma * bars.sqrt());
+            if tight <= PIT_MAX_TIGHT
+                && depth >= PIT_MIN_DEPTH_NOISE * sigma
+                // The floor has held before: after the lowest close, a later
+                // one is back above the middle of the box…
+                && top_since_floor > (floor + top) / 2.0
+                // …and the whole drop stays under it, but for a retest.
+                && floor > drop_high - PIT_RETEST * height
+            {
+                candidates.push(PitBox { start, end, floor, top, tight });
+            }
+        }
+
+        // The tightest of them that is also level and swings across the band.
+        candidates.sort_by(|a, b| a.tight.total_cmp(&b.tight).then(a.start.cmp(&b.start)));
+        for candidate in candidates {
+            if best.as_ref().is_some_and(|b| candidate.tight >= b.tight) {
+                break;
+            }
+            let closes = &close[candidate.start..=end];
+            let height = candidate.top - candidate.floor;
+            // Centre of the box, on time scaled to run from x = 0 to x = 1:
+            // b + c is its change end to end, c/4 the sag of its midpoint.
+            let span = (closes.len() - 1) as f64;
+            let Some([_, b, c]) =
+                fit_parabola(closes.iter().enumerate().map(|(i, &y)| (i as f64 / span, y, 1.0)))
+            else {
+                continue;
+            };
+            if (b + c).abs() > PIT_MAX_TILT * height || -c / 4.0 > PIT_MAX_ARCH * height {
+                continue;
+            }
+            if band_swings(closes, candidate.floor, candidate.top) >= PIT_MIN_SWINGS {
+                best = Some(candidate);
+                break;
+            }
+        }
+    }
+    best
+}
+
+/// How many times `closes` travel from one outer third of the band between
+/// `floor` and `top` to the other.
+fn band_swings(closes: &[f64], floor: f64, top: f64) -> usize {
+    let third = (top - floor) / 3.0;
+    let (lower, upper) = (floor + third, top - third);
+    let mut side = 0;
+    let mut swings = 0;
+    for &c in closes {
+        let now = if c <= lower {
+            -1
+        } else if c >= upper {
+            1
+        } else {
+            0
+        };
+        if now != 0 && now != side {
+            if side != 0 {
+                swings += 1;
+            }
+            side = now;
+        }
+    }
+    swings
+}
+
 // ── Data filter types and logic ──
 //
 // A filter bundle is a list of user-editable lines. Each line is
@@ -1184,12 +1612,12 @@ fn fit_parabola(points: impl Iterator<Item = (f64, f64, f64)>) -> Option<[f64; 3
 //
 // Lines are ANDed together: a stock matches only if every line holds.
 //
-// The `arc_*` columns describe an arc structure (see above) rather than a bar.
-// A stock can hold several structures at once, so they are bound like a
+// The `arc_*` and `pit_*` columns describe a structure (see above) rather than
+// a bar. A stock can hold several structures at once, so they are bound like a
 // variable: within one line, on one timeframe, every `arc_*` refers to the
-// same structure, and the line holds if any one structure satisfies it. To
-// describe one structure with several conditions, join them with `and` on a
-// single line.
+// same arc structure and every `pit_*` to the same pit structure, and the line
+// holds if any one of them satisfies it. To describe one structure with
+// several conditions, join them with `and` on a single line.
 
 #[derive(Debug, Clone)]
 pub struct DataFilter {
@@ -1233,15 +1661,36 @@ impl FilterExpr {
         });
     }
 
-    fn uses_arc(&self) -> bool {
+    fn uses_column(&self, family: fn(&str) -> bool) -> bool {
         let mut found = false;
-        self.for_each_operand(&mut |op| found |= is_arc_column(&op.column));
+        self.for_each_operand(&mut |op| found |= family(&op.column));
         found
+    }
+
+    fn uses_arc(&self) -> bool {
+        self.uses_column(is_arc_column)
+    }
+
+    fn uses_pit(&self) -> bool {
+        self.uses_column(is_pit_column)
+    }
+
+    /// Reads a column that describes a whole structure rather than a bar.
+    fn uses_structure(&self) -> bool {
+        self.uses_column(is_structure_column)
     }
 }
 
 fn is_arc_column(column: &str) -> bool {
     column.starts_with("arc_")
+}
+
+fn is_pit_column(column: &str) -> bool {
+    column.starts_with("pit_")
+}
+
+fn is_structure_column(column: &str) -> bool {
+    is_arc_column(column) || is_pit_column(column)
 }
 
 /// One line of a filter bundle: an optional timeframe prefix plus the
@@ -1506,7 +1955,7 @@ fn parse_single_operand(s: &str) -> Result<FilterOperand, String> {
     };
 
     validate_column(&column)?;
-    if offset != 0 && is_arc_column(&column) {
+    if offset != 0 && is_structure_column(&column) {
         return Err(format!("{} 描述的是整段走势, 不支持 [N]", column));
     }
 
@@ -1525,21 +1974,106 @@ fn validate_column(column: &str) -> Result<(), String> {
             _ => Err(format!("无效的均线: {} (示例: ma10, ma250)", column)),
         };
     }
-    if ARC_COLUMNS.contains(&column) {
+    if let Some((prefix, rest)) = WINDOW_PREFIXES
+        .iter()
+        .find_map(|p| column.strip_prefix(p).map(|rest| (p, rest)))
+    {
+        // `hhv`, `atr`, ... are only window columns when a number follows;
+        // anything else falls through to the unknown-column error.
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return match rest.parse::<usize>() {
+                Ok(n) if n > 0 => Ok(()),
+                _ => Err(format!("无效的窗口: {} (示例: {}60)", column, prefix)),
+            };
+        }
+    }
+    if ARC_COLUMNS.contains(&column) || PIT_COLUMNS.contains(&column) {
         return Ok(());
     }
     Err(format!(
-        "未知字段: {} (可用: close/price, open, high, low, volume, maN, {})",
+        "未知字段: {} (可用: close/price, open, high, low, volume, maN, hhvN, llvN, posN, atrN, vmaN, {}, {})",
         column,
-        ARC_COLUMNS.join(", ")
+        ARC_COLUMNS.join(", "),
+        PIT_COLUMNS.join(", ")
     ))
+}
+
+// ── Window columns (`hhvN`, `llvN`, `posN`, `atrN`, `vmaN`) ──
+//
+// Statistics over the N bars ending at the row being read, so they take a
+// `[K]` offset like any price column (`vma20[-1]` = the 20-bar average volume
+// as of yesterday). They are computed on demand from the candles: a filter
+// reads a handful of them per stock, each at one or two rows.
+//
+//   hhvN  highest high          llvN  lowest low
+//   posN  where the close sits between llvN (0) and hhvN (100)
+//   atrN  average true range, % of the previous close (how far it moves a day)
+//   vmaN  average volume
+
+const WINDOW_PREFIXES: [&str; 5] = ["hhv", "llv", "pos", "atr", "vma"];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WindowStat {
+    Hhv,
+    Llv,
+    Pos,
+    Atr,
+    Vma,
+}
+
+/// Splits `hhv60` into `(Hhv, 60)`; `None` for every other column.
+fn window_column(column: &str) -> Option<(WindowStat, usize)> {
+    let stat = match column.get(..3)? {
+        "hhv" => WindowStat::Hhv,
+        "llv" => WindowStat::Llv,
+        "pos" => WindowStat::Pos,
+        "atr" => WindowStat::Atr,
+        "vma" => WindowStat::Vma,
+        _ => return None,
+    };
+    let n = column[3..].parse::<usize>().ok().filter(|&n| n > 0)?;
+    Some((stat, n))
+}
+
+/// The window column's value over the `n` bars ending at `idx`. `None` until
+/// that much history exists (`atrN` needs one bar more, for the first bar's
+/// previous close), or when the value is undefined (a flat window has no
+/// position; a non-positive adjusted close has no percentage range).
+fn window_value(candles: &[Candle], idx: usize, stat: WindowStat, n: usize) -> Option<f64> {
+    let start = (idx + 1).checked_sub(n)?;
+    let bars = candles.get(start..=idx)?;
+    let hhv = || bars.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max);
+    let llv = || bars.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+    match stat {
+        WindowStat::Hhv => Some(hhv()),
+        WindowStat::Llv => Some(llv()),
+        WindowStat::Pos => {
+            let (high, low) = (hhv(), llv());
+            (high > low).then(|| (candles[idx].close - low) / (high - low) * 100.0)
+        }
+        WindowStat::Vma => Some(bars.iter().map(|c| c.volume).sum::<f64>() / n as f64),
+        WindowStat::Atr => {
+            let first_prev = start.checked_sub(1)?;
+            let mut sum = 0.0;
+            for (prev, bar) in candles[first_prev..idx].iter().zip(bars) {
+                if prev.close <= 0.0 {
+                    return None;
+                }
+                let range = (bar.high - bar.low)
+                    .max((bar.high - prev.close).abs())
+                    .max((bar.low - prev.close).abs());
+                sum += range / prev.close;
+            }
+            Some(sum / n as f64 * 100.0)
+        }
+    }
 }
 
 /// A stock matches when every line holds. A line with an explicit `day:` /
 /// `week:` prefix is evaluated on that timeframe; an unprefixed line is
 /// evaluated on `default_periods` and passes if it holds on any of them.
 ///
-/// A line reading `arc_*` columns holds on a timeframe if any one arc
+/// A line reading `arc_*` or `pit_*` columns holds on a timeframe if any one
 /// structure found there satisfies the whole line.
 pub fn evaluate_filters_on_stock(
     stock_dir: &Path,
@@ -1580,16 +2114,45 @@ pub fn evaluate_filters_on_stock(
         windows: &windows,
         candles: HashMap::new(),
         arcs: HashMap::new(),
+        pits: HashMap::new(),
     };
 
     // Plain lines go first: they are cheap and reject most stocks before any
-    // arc detection has to run.
-    let (arc_lines, plain_lines): (Vec<&FilterLine>, Vec<&FilterLine>) =
-        lines.iter().partition(|l| l.expr.uses_arc());
-    plain_lines.into_iter().chain(arc_lines).all(|line| match line.period {
+    // structure detection has to run.
+    let (structure_lines, plain_lines): (Vec<&FilterLine>, Vec<&FilterLine>) =
+        lines.iter().partition(|l| l.expr.uses_structure());
+    plain_lines.into_iter().chain(structure_lines).all(|line| match line.period {
         Some(p) => data.line_holds(&line.expr, p),
         None => defaults.iter().any(|&p| data.line_holds(&line.expr, p)),
     })
+}
+
+/// The structures to mark on a chart of `period` for a stock a bundle matched,
+/// so the chart shows why it was picked.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MatchedShapes {
+    pub arc: Option<ArcStructure>,
+    pub pit: Option<PitStructure>,
+}
+
+impl MatchedShapes {
+    pub fn is_empty(&self) -> bool {
+        self.arc.is_none() && self.pit.is_none()
+    }
+}
+
+/// Both kinds of structure to draw: see `arc_to_draw` and `pit_to_draw`.
+pub fn shapes_to_draw(
+    lines: &[FilterLine],
+    default_periods: &[Period],
+    period: Period,
+    candles: &[Candle],
+    ma_lines: &[MaLine],
+) -> MatchedShapes {
+    MatchedShapes {
+        arc: arc_to_draw(lines, default_periods, period, candles, ma_lines),
+        pit: pit_to_draw(lines, default_periods, period, candles, ma_lines),
+    }
 }
 
 /// The arc structure to draw on a chart of `period` for a stock this bundle
@@ -1604,22 +2167,13 @@ pub fn arc_to_draw(
     candles: &[Candle],
     ma_lines: &[MaLine],
 ) -> Option<ArcStructure> {
-    let defaults: &[Period] = if default_periods.is_empty() {
-        &[Period::Daily]
-    } else {
-        default_periods
-    };
-    let arc_lines: Vec<&FilterLine> = lines
-        .iter()
-        .filter(|l| l.expr.uses_arc())
-        .filter(|l| l.period.map_or(defaults.contains(&period), |p| p == period))
-        .collect();
-    if arc_lines.is_empty() || candles.is_empty() {
+    let lines = lines_reading(lines, default_periods, period, FilterExpr::uses_arc);
+    if lines.is_empty() || candles.is_empty() {
         return None;
     }
     let satisfied = |arc: &ArcStructure| {
-        let ctx = FilterContext { candles, ma_lines, arc: Some(arc) };
-        arc_lines.iter().filter(|l| eval_expr(&ctx, &l.expr)).count()
+        let ctx = FilterContext { candles, ma_lines, arc: Some(arc), pit: None };
+        lines.iter().filter(|l| eval_expr(&ctx, &l.expr)).count()
     };
     find_arc_structures(candles)
         .into_iter()
@@ -1629,13 +2183,59 @@ pub fn arc_to_draw(
         .map(|(_, arc)| arc)
 }
 
-/// One stock's candles and arc structures, each computed at most once per
+/// The same for `pit_*` lines: the pit structure that satisfies them on this
+/// timeframe, preferring the one with the longest box.
+pub fn pit_to_draw(
+    lines: &[FilterLine],
+    default_periods: &[Period],
+    period: Period,
+    candles: &[Candle],
+    ma_lines: &[MaLine],
+) -> Option<PitStructure> {
+    let lines = lines_reading(lines, default_periods, period, FilterExpr::uses_pit);
+    if lines.is_empty() || candles.is_empty() {
+        return None;
+    }
+    let satisfied = |pit: &PitStructure| {
+        let ctx = FilterContext { candles, ma_lines, arc: None, pit: Some(pit) };
+        lines.iter().filter(|l| eval_expr(&ctx, &l.expr)).count()
+    };
+    find_pit_structures(candles)
+        .into_iter()
+        .map(|pit| (satisfied(&pit), pit))
+        .filter(|(n, _)| *n > 0)
+        .max_by_key(|(n, pit)| (*n, pit.box_len))
+        .map(|(_, pit)| pit)
+}
+
+/// The lines of a bundle that apply to `period` and read one family of
+/// structure columns.
+fn lines_reading<'a>(
+    lines: &'a [FilterLine],
+    default_periods: &[Period],
+    period: Period,
+    reads: fn(&FilterExpr) -> bool,
+) -> Vec<&'a FilterLine> {
+    let defaults: &[Period] = if default_periods.is_empty() {
+        &[Period::Daily]
+    } else {
+        default_periods
+    };
+    lines
+        .iter()
+        .filter(|l| reads(&l.expr))
+        .filter(|l| l.period.map_or(defaults.contains(&period), |p| p == period))
+        .collect()
+}
+
+/// One stock's candles and structures, each computed at most once per
 /// timeframe and shared across lines.
 struct StockData<'a> {
     dir: &'a Path,
     windows: &'a [usize],
     candles: HashMap<Period, (Vec<Candle>, Vec<MaLine>)>,
     arcs: HashMap<Period, Vec<ArcStructure>>,
+    pits: HashMap<Period, Vec<PitStructure>>,
 }
 
 impl StockData<'_> {
@@ -1660,23 +2260,33 @@ impl StockData<'_> {
         if candles.is_empty() {
             return false;
         }
-        let holds_with = |arc: Option<&ArcStructure>| {
-            eval_expr(&FilterContext { candles, ma_lines, arc }, expr)
-        };
-        if !expr.uses_arc() {
-            return holds_with(None);
-        }
-        let arcs = self
-            .arcs
-            .entry(period)
-            .or_insert_with(|| find_arc_structures(candles));
-        // With no structure the `arc_*` comparisons are simply unresolved
-        // (false), which still lets an `or` branch carry the line.
-        if arcs.is_empty() {
-            holds_with(None)
+        // Each family of structure columns the line reads is bound to every
+        // structure found, in turn; a family it does not read stays unbound.
+        let arcs = if expr.uses_arc() {
+            bindings(self.arcs.entry(period).or_insert_with(|| find_arc_structures(candles)))
         } else {
-            arcs.iter().any(|arc| holds_with(Some(arc)))
-        }
+            vec![None]
+        };
+        let pits = if expr.uses_pit() {
+            bindings(self.pits.entry(period).or_insert_with(|| find_pit_structures(candles)))
+        } else {
+            vec![None]
+        };
+        arcs.iter().any(|&arc| {
+            pits.iter()
+                .any(|&pit| eval_expr(&FilterContext { candles, ma_lines, arc, pit }, expr))
+        })
+    }
+}
+
+/// What a family of structure columns can be bound to: each structure found,
+/// or nothing at all when there is none. Unbound, its comparisons are simply
+/// unresolved (false), which still lets an `or` branch carry the line.
+fn bindings<T>(found: &[T]) -> Vec<Option<&T>> {
+    if found.is_empty() {
+        vec![None]
+    } else {
+        found.iter().map(Some).collect()
     }
 }
 
@@ -1710,8 +2320,9 @@ fn eval_cmp(ctx: &FilterContext<'_>, filter: &DataFilter) -> bool {
 struct FilterContext<'a> {
     candles: &'a [Candle],
     ma_lines: &'a [MaLine],
-    /// The structure `arc_*` columns currently refer to, if any.
+    /// The structures `arc_*` and `pit_*` columns currently refer to, if any.
     arc: Option<&'a ArcStructure>,
+    pit: Option<&'a PitStructure>,
 }
 
 fn resolve_operand_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Option<f64> {
@@ -1748,6 +2359,20 @@ fn resolve_single_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Opt
         };
     }
 
+    if is_pit_column(&operand.column) {
+        let pit = ctx.pit?;
+        return match operand.column.as_str() {
+            "pit_box" => Some(pit.box_len as f64),
+            "pit_amp" => Some(pit.amp),
+            "pit_drop" => Some(pit.drop),
+            "pit_under" => Some(pit.under as f64),
+            "pit_len" => Some(pit.len as f64),
+            "pit_up" => Some(pit.up),
+            "pit_pos" => Some(pit.pos),
+            _ => None,
+        };
+    }
+
     // offset 0 = latest, offset N = N bars ago
     let idx = ctx.candles.len().checked_sub(operand.offset + 1)?;
 
@@ -1761,6 +2386,10 @@ fn resolve_single_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Opt
             }
             return Some(val);
         }
+    }
+
+    if let Some((stat, n)) = window_column(&operand.column) {
+        return window_value(ctx.candles, idx, stat, n);
     }
 
     let c = ctx.candles.get(idx)?;
@@ -1876,6 +2505,254 @@ mod tests {
         // Unbalanced parens are rejected rather than silently mis-parsed.
         assert!(parse_filter_expr("(close > ma5").is_err());
         assert!(parse_filter_expr("close > ma5)").is_err());
+    }
+
+    /// Writes `daily.csv` from `(open, high, low, close, volume)` bars dated on
+    /// consecutive weekdays from 2024-01-01 (a Monday), so five bars make a week.
+    fn stock_dir_with_bars(name: &str, bars: &[(f64, f64, f64, f64, f64)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut csv = String::from("date,open,close,high,low,volume,amount\n");
+        let month_days = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        for (i, (o, h, l, c, v)) in bars.iter().enumerate() {
+            let day_of_year = i / 5 * 7 + i % 5; // weekends skipped
+            let (mut y, mut d) = (2024, day_of_year);
+            while d >= 366 - (y != 2024) as usize {
+                d -= 366 - (y != 2024) as usize;
+                y += 1;
+            }
+            let mut m = 0;
+            loop {
+                let len = if m == 1 && y != 2024 { 28 } else { month_days[m] };
+                if d < len {
+                    break;
+                }
+                d -= len;
+                m += 1;
+            }
+            csv.push_str(&format!("{y}-{:02}-{:02},{o},{c},{h},{l},{v},\n", m + 1, d + 1));
+        }
+        std::fs::write(dir.join("daily.csv"), csv).unwrap();
+        dir
+    }
+
+    #[test]
+    fn window_columns_parse_like_any_other_column() {
+        for ok in [
+            "hhv60 >= hhv120",
+            "close/llv120 >= 1.4",
+            "pos60 >= 60",
+            "atr60 >= 4",
+            "vma5 >= vma60",
+            "volume/vma20[-1] >= 1.5",
+            "ATR20 > 3", // case-insensitive, like the price columns
+        ] {
+            assert!(parse_filter_expr(ok).is_ok(), "{ok}");
+        }
+        // A window column needs a positive bar count…
+        for bad in ["hhv0 > 1", "hhv > 1", "atr > 1", "vma-5 > 1", "pos6x > 1", "llv60d > 1"] {
+            assert!(parse_filter_expr(bad).is_err(), "{bad}");
+        }
+        // …and `vma5` must not be mistaken for the price average `ma5`.
+        assert_eq!(window_column("vma5"), Some((WindowStat::Vma, 5)));
+        assert_eq!(window_column("ma5"), None);
+    }
+
+    #[test]
+    fn window_columns_measure_the_last_n_bars() {
+        // (open, high, low, close, volume)
+        let bars = [
+            (10.0, 10.5, 9.5, 10.0, 100.0),
+            (10.0, 11.0, 10.0, 11.0, 200.0), // true range 1.0 on a close of 10
+            (11.0, 12.5, 11.0, 12.0, 300.0), // 1.5 on 11
+            (12.0, 12.0, 10.8, 11.4, 400.0), // 1.2 on 12
+        ];
+        let candles: Vec<Candle> = bars
+            .iter()
+            .map(|&(open, high, low, close, volume)| Candle {
+                timestamp: String::new(),
+                open,
+                close,
+                high,
+                low,
+                volume,
+                amount: None,
+            })
+            .collect();
+        let at = |idx, stat, n| window_value(&candles, idx, stat, n);
+        let near = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-9);
+
+        assert_eq!(at(3, WindowStat::Hhv, 3), Some(12.5));
+        assert_eq!(at(3, WindowStat::Llv, 3), Some(10.0));
+        assert_eq!(at(3, WindowStat::Hhv, 1), Some(12.0)); // today's bar counts
+        assert_eq!(at(2, WindowStat::Llv, 3), Some(9.5)); // …and the window ends at the row read
+        assert_eq!(at(3, WindowStat::Vma, 2), Some(350.0));
+        // Close 11.4 between a low of 10.0 and a high of 12.5.
+        assert!(near(at(3, WindowStat::Pos, 3), 56.0));
+        // Mean of 1.0/10, 1.5/11 and 1.2/12, in percent.
+        assert!(near(at(3, WindowStat::Atr, 3), (0.1 + 1.5 / 11.0 + 0.1) / 3.0 * 100.0));
+
+        // Not enough history: unresolved, never a partial window.
+        assert_eq!(at(3, WindowStat::Hhv, 5), None);
+        assert_eq!(at(3, WindowStat::Vma, 5), None);
+        // `atrN` needs the close before its first bar.
+        assert!(at(3, WindowStat::Atr, 3).is_some());
+        assert_eq!(at(3, WindowStat::Atr, 4), None);
+        // A window that never moved has no position.
+        let flat = vec![candles[0].clone(); 3];
+        let flat: Vec<Candle> = flat
+            .into_iter()
+            .map(|c| Candle { high: 10.0, low: 10.0, ..c })
+            .collect();
+        assert_eq!(window_value(&flat, 2, WindowStat::Pos, 3), None);
+    }
+
+    #[test]
+    fn window_columns_work_in_filters_with_offsets_and_periods() {
+        // 30 flat bars, then a 3-bar push to 13 on five times the volume.
+        let mut bars = vec![(10.0, 10.2, 9.8, 10.0, 100.0); 30];
+        bars.extend([
+            (10.0, 11.0, 10.0, 11.0, 500.0),
+            (11.0, 12.0, 11.0, 12.0, 500.0),
+            (12.0, 13.0, 12.0, 13.0, 500.0),
+        ]);
+        let dir = stock_dir_with_bars("chart_app_window_columns", &bars);
+        let ma = vec![];
+        let holds = |line: &str| {
+            evaluate_filters_on_stock(&dir, &filter_lines(&[line]), &ma, &[Period::Daily])
+        };
+
+        assert!(holds("high >= hhv20"));
+        assert!(holds("pos20 >= 100"));
+        assert!(holds("close/llv20 >= 1.3"));
+        assert!(holds("volume/vma20[-3] >= 5")); // against the average before the push
+        assert!(!holds("volume/vma20 >= 5")); // the push is in today's average
+        assert!(holds("vma3 > vma20"));
+        assert!(holds("hhv20[-3] <= 10.2")); // the range as it stood three bars ago
+        assert!(holds("atr3 >= 8 and atr3[-3] <= 4.1"));
+        // Unresolved (33 bars of history) is false either way round.
+        assert!(!holds("hhv60 >= 1"));
+        assert!(!holds("hhv60 < 1"));
+        // On the weekly chart the same columns count weeks: 33 daily bars are
+        // 7 weekly ones, the last holding the whole push.
+        assert!(holds("week: high >= hhv7 and low <= llv1"));
+        assert!(!holds("week: hhv8 >= 1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 400 bars shaped like the 蓄势待发 preset: a year of drifting sideways, a
+    /// rally of about 60% on heavy volume, then 40 quiet bars near the top with
+    /// the volume returning over the last week. `tweak` edits the bars so each
+    /// test can break one property.
+    fn setup_bars(tweak: impl Fn(usize, &mut (f64, f64, f64, f64, f64))) -> Vec<(f64, f64, f64, f64, f64)> {
+        let mut bars = Vec::new();
+        let mut close = 10.0_f64;
+        for i in 0..400 {
+            let (step, volume): (f64, f64) = match i {
+                0..=299 => (if i % 2 == 0 { 0.02 } else { -0.019 }, 1000.0),
+                300..=359 => (0.012, 1500.0),                           // the rally
+                360..=394 => (if i % 2 == 0 { 0.01 } else { -0.012 }, 500.0), // the fight, volume cooling
+                _ => (if i % 2 == 0 { 0.012 } else { -0.008 }, 1200.0),  // volume returning
+            };
+            let open = close;
+            close *= 1.0 + step;
+            // A 5% daily range keeps the stock "active".
+            let mut bar = (open, open.max(close) * 1.02, open.min(close) * 0.97, close, volume);
+            tweak(i, &mut bar);
+            close = bar.3;
+            bars.push(bar);
+        }
+        bars
+    }
+
+    fn preset(name: &str) -> NamedFilter {
+        preset_filters().into_iter().find(|p| p.name == name).unwrap()
+    }
+
+    fn matches_preset(test: &str, name: &str, bars: &[(f64, f64, f64, f64, f64)]) -> bool {
+        let dir = stock_dir_with_bars(test, bars);
+        let bundle = preset(name);
+        let lines = parse_filter_lines(&bundle.filters).unwrap();
+        let hit = evaluate_filters_on_stock(&dir, &lines, &[], &bundle.periods);
+        let _ = std::fs::remove_dir_all(&dir);
+        hit
+    }
+
+    #[test]
+    fn presets_parse() {
+        for p in preset_filters() {
+            let lines = parse_filter_lines(&p.filters).unwrap_or_else(|e| panic!("{}: {e}", p.name));
+            assert!(!lines.is_empty(), "{}", p.name);
+            // Each bundle reads both charts: its lines pin a timeframe
+            // apiece, or it scans either one.
+            assert_eq!(p.active_periods().len(), 2, "{}", p.name);
+        }
+    }
+
+    #[test]
+    fn setup_preset_finds_a_rally_held_near_its_top() {
+        assert!(matches_preset("chart_app_setup_ok", "蓄势待发", &setup_bars(|_, _| {})));
+    }
+
+    #[test]
+    fn setup_preset_rejects_what_the_study_ruled_out() {
+        let fails = |test: &str, tweak: &dyn Fn(usize, &mut (f64, f64, f64, f64, f64))| {
+            !matches_preset(test, "蓄势待发", &setup_bars(tweak))
+        };
+        // Volume still shrinking into the last week: the fight is not over.
+        assert!(fails("chart_app_setup_dry", &|i, b| {
+            if i >= 395 {
+                b.4 = 300.0;
+            }
+        }));
+        // Heavy volume all through the pause: it never cooled.
+        assert!(fails("chart_app_setup_hot", &|i, b| {
+            if i >= 300 {
+                b.4 = 3000.0;
+            }
+        }));
+        // A sleepy stock: 1% daily ranges.
+        assert!(fails("chart_app_setup_quiet", &|_, b| {
+            b.1 = b.0.max(b.3) * 1.004;
+            b.2 = b.0.min(b.3) * 0.996;
+        }));
+        // Already launched: +9% today.
+        assert!(fails("chart_app_setup_launched", &|i, b| {
+            if i == 399 {
+                b.3 = b.0 * 1.09;
+                b.1 = b.3;
+            }
+        }));
+        // The pause gave back half the rally: no longer in the upper range.
+        assert!(fails("chart_app_setup_deep", &|i, b| {
+            if (380..400).contains(&i) {
+                let k = 0.988; // compounds bar over bar: about -21% in 20 bars
+                *b = (b.0 * k, b.1 * k, b.2 * k, b.3 * k, b.4);
+            }
+        }));
+        // No rally at all: the same year of drift, extended.
+        let flat: Vec<_> = setup_bars(|_, _| {}).into_iter().take(300).cycle().take(400).collect();
+        assert!(!matches_preset("chart_app_setup_flat", "蓄势待发", &flat));
+    }
+
+    #[test]
+    fn breakout_preset_wants_the_first_big_candle_on_volume() {
+        // The setup above, then one +7% bar on triple volume to a new high.
+        let breakout = |volume: f64, gain: f64| {
+            let mut bars = setup_bars(|_, _| {});
+            let last = bars[399].3;
+            let close = last * (1.0 + gain);
+            bars.push((last, close * 1.01, last * 0.995, close, volume));
+            bars
+        };
+        assert!(matches_preset("chart_app_breakout_ok", "放量突破", &breakout(3600.0, 0.07)));
+        assert!(!matches_preset("chart_app_breakout_thin", "放量突破", &breakout(900.0, 0.07)));
+        assert!(!matches_preset("chart_app_breakout_small", "放量突破", &breakout(3600.0, 0.03)));
+        // The quiet setup itself is not a breakout, and vice versa.
+        assert!(!matches_preset("chart_app_breakout_none", "放量突破", &setup_bars(|_, _| {})));
+        assert!(!matches_preset("chart_app_breakout_setup", "蓄势待发", &breakout(3600.0, 0.07)));
     }
 
     #[test]
@@ -2736,5 +3613,436 @@ mod tests {
         assert!(holds("arc_len >= 1 or close > ma20"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Pit structures ──
+
+    /// Closes shaped like what the `pit_*` detector looks for: a climb from
+    /// 7.5 to 10, a box of `legs` straight runs between 10 and 11 (`leg` bars
+    /// each, the first one upward), then `after` — straight runs of
+    /// `(bars, level)`, each starting where the last one ended. Every close
+    /// wobbles ±`wobble` around that path from one bar to the next: real
+    /// closes never run straight, and that wobble is the `sigma` the
+    /// detector's tolerances are measured in.
+    fn pit_closes_with(legs: usize, leg: usize, wobble: f64, after: &[(usize, f64)]) -> Vec<f64> {
+        let mut path: Vec<f64> = (0..30).map(|i| 7.5 + 2.5 * i as f64 / 30.0).collect();
+        let mut level = 10.0;
+        let box_runs = (0..legs).map(|k| (leg, if k % 2 == 0 { 11.0 } else { 10.0 }));
+        for (bars, target) in box_runs.chain(after.iter().copied()) {
+            path.extend((0..bars).map(|i| level + (target - level) * i as f64 / bars as f64));
+            level = target;
+        }
+        path.push(level);
+        path.iter()
+            .enumerate()
+            .map(|(i, p)| p * if i % 2 == 0 { 1.0 + wobble } else { 1.0 - wobble })
+            .collect()
+    }
+
+    /// The usual box: nine runs of eight bars, closes wobbling by ±0.8%.
+    fn pit_closes(after: &[(usize, f64)]) -> Vec<f64> {
+        pit_closes_with(9, 8, 0.008, after)
+    }
+
+    /// 企稳走强: ten bars down to 9.3 (7% under the box), eight bars going
+    /// nowhere, eight bars back up to 10.6.
+    const PIT_SHARP: &[(usize, f64)] = &[(10, 9.3), (8, 9.35), (8, 10.6)];
+    /// 慢慢震荡向上: the same drop, then three steps up, each half given back.
+    const PIT_SLOW: &[(usize, f64)] = &[
+        (10, 9.3), (6, 9.7), (4, 9.5), (6, 10.0), (4, 9.8), (6, 10.4), (4, 10.2), (4, 10.5),
+    ];
+
+    /// Candles for a series of closes: each bar opens at the previous close
+    /// and has a small shadow either side.
+    fn candles_from_closes(closes: &[f64]) -> Vec<Candle> {
+        closes
+            .iter()
+            .enumerate()
+            .map(|(i, &close)| {
+                let open = if i == 0 { close } else { closes[i - 1] };
+                Candle {
+                    // Sequential calendar days from 2025-01-01, as in `stock_dir_with_closes`.
+                    timestamp: format!("2025-{:02}-{:02}", i / 28 + 1, i % 28 + 1),
+                    open,
+                    close,
+                    high: open.max(close) * 1.004,
+                    low: open.min(close) * 0.996,
+                    volume: 100.0,
+                    amount: None,
+                }
+            })
+            .collect()
+    }
+
+    /// A real instance of the shape, picked by eye: 歌尔股份 (sz002241) daily,
+    /// forward-adjusted, as (date, open, high, low, close). Three months
+    /// between 21.4 and 24.6 from 2026-07-09, four closes under that on
+    /// 2026-10-12…15 down to a low of 19.50, then back inside within a week
+    /// and up to the top of the box by mid-November.
+    const PIT_EXAMPLE: &[(&str, f64, f64, f64, f64)] = &[
+        ("2026-06-15", 23.21, 23.6, 23.11, 23.56), ("2026-06-16", 23.33, 23.61, 23.31, 23.35),
+        ("2026-06-17", 23.11, 23.96, 23.07, 23.68), ("2026-06-18", 23.5, 24.11, 23.35, 23.92),
+        ("2026-06-22", 23.93, 24.02, 23.0, 23.72), ("2026-06-23", 23.5, 24.07, 22.96, 23.07),
+        ("2026-06-24", 22.89, 24.16, 22.57, 23.83), ("2026-06-25", 23.71, 24.42, 23.52, 23.85),
+        ("2026-06-26", 23.31, 23.35, 22.31, 22.33), ("2026-06-29", 22.22, 22.4, 21.22, 21.43),
+        ("2026-06-30", 21.48, 22.6, 21.45, 22.53), ("2026-07-01", 22.48, 22.68, 22.12, 22.32),
+        ("2026-07-02", 22.14, 22.38, 21.69, 21.72), ("2026-07-03", 21.95, 22.33, 21.76, 22.05),
+        ("2026-07-06", 22.06, 22.21, 21.42, 21.47), ("2026-07-07", 21.47, 21.8, 21.03, 21.08),
+        ("2026-07-08", 21.03, 21.12, 20.37, 20.41), ("2026-07-09", 20.41, 21.43, 20.22, 21.37),
+        ("2026-07-10", 21.21, 23.51, 21.13, 22.57), ("2026-07-13", 22.45, 22.52, 21.68, 21.82),
+        ("2026-07-14", 21.86, 21.99, 20.9, 21.73), ("2026-07-15", 21.75, 22.58, 21.33, 22.25),
+        ("2026-07-16", 22.49, 23.87, 22.29, 23.02), ("2026-07-17", 23.0, 23.57, 22.09, 23.01),
+        ("2026-07-20", 22.53, 23.39, 22.2, 23.21), ("2026-07-21", 22.99, 23.5, 22.76, 23.42),
+        ("2026-07-22", 23.19, 23.29, 22.37, 22.38), ("2026-07-23", 22.16, 22.49, 21.8, 22.49),
+        ("2026-07-24", 22.05, 23.62, 21.93, 22.67), ("2026-07-27", 22.5, 23.05, 22.08, 22.87),
+        ("2026-07-28", 22.57, 23.41, 22.55, 22.85), ("2026-07-29", 22.98, 23.98, 22.93, 23.69),
+        ("2026-07-30", 23.48, 23.6, 23.01, 23.06), ("2026-07-31", 23.07, 23.49, 23.07, 23.1),
+        ("2026-08-03", 22.87, 23.42, 22.63, 23.24), ("2026-08-04", 23.3, 23.4, 23.05, 23.11),
+        ("2026-08-05", 22.99, 23.86, 22.88, 23.71), ("2026-08-06", 23.4, 23.91, 23.32, 23.44),
+        ("2026-08-07", 23.44, 23.9, 23.16, 23.29), ("2026-08-10", 23.3, 23.36, 22.73, 22.83),
+        ("2026-08-11", 22.68, 23.0, 22.62, 22.7), ("2026-08-12", 22.6, 22.69, 22.42, 22.56),
+        ("2026-08-13", 22.57, 22.69, 22.11, 22.12), ("2026-08-14", 22.17, 22.34, 21.68, 21.88),
+        ("2026-08-17", 21.81, 22.13, 21.71, 22.11), ("2026-08-18", 22.01, 22.59, 21.71, 22.48),
+        ("2026-08-19", 22.2, 22.36, 21.88, 21.98), ("2026-08-20", 22.08, 22.43, 21.86, 22.02),
+        ("2026-08-21", 22.44, 23.64, 22.29, 23.4), ("2026-08-24", 24.38, 24.8, 23.35, 23.48),
+        ("2026-08-25", 23.49, 23.62, 22.68, 23.07), ("2026-08-26", 23.07, 24.08, 22.9, 23.82),
+        ("2026-08-27", 23.62, 24.22, 23.5, 23.89), ("2026-08-28", 23.83, 24.08, 23.51, 23.51),
+        ("2026-08-31", 23.25, 24.3, 23.25, 24.25), ("2026-09-01", 24.16, 24.26, 23.9, 23.93),
+        ("2026-09-02", 23.73, 24.45, 23.69, 24.14), ("2026-09-03", 24.14, 24.24, 23.58, 23.78),
+        ("2026-09-04", 23.9, 23.98, 23.23, 23.41), ("2026-09-07", 23.6, 23.79, 23.34, 23.6),
+        ("2026-09-08", 23.6, 24.17, 23.23, 23.68), ("2026-09-09", 23.53, 23.65, 22.91, 23.01),
+        ("2026-09-10", 22.8, 22.85, 22.46, 22.53), ("2026-09-11", 22.3, 22.66, 22.02, 22.24),
+        ("2026-09-14", 22.03, 22.35, 21.97, 22.06), ("2026-09-15", 21.98, 22.08, 21.33, 21.37),
+        ("2026-09-16", 21.37, 21.78, 21.14, 21.53), ("2026-09-17", 21.31, 22.35, 21.31, 22.28),
+        ("2026-09-18", 22.69, 23.6, 22.65, 23.33), ("2026-09-21", 23.5, 23.82, 23.18, 23.8),
+        ("2026-09-22", 25.0, 25.48, 24.0, 24.64), ("2026-09-23", 24.84, 25.08, 24.4, 24.45),
+        ("2026-09-24", 24.41, 24.45, 23.77, 23.94), ("2026-09-28", 24.24, 24.3, 22.98, 23.15),
+        ("2026-09-29", 23.0, 23.26, 22.84, 23.0), ("2026-09-30", 23.13, 23.43, 22.76, 22.79),
+        ("2026-10-08", 22.79, 23.03, 21.56, 21.7), ("2026-10-09", 21.71, 21.78, 20.96, 21.51),
+        ("2026-10-12", 21.3, 21.4, 20.81, 20.85), ("2026-10-13", 20.48, 20.83, 20.33, 20.63),
+        ("2026-10-14", 20.5, 20.55, 20.02, 20.03), ("2026-10-15", 19.6, 20.3, 19.5, 20.23),
+        ("2026-10-16", 20.35, 20.42, 19.68, 19.93), ("2026-10-19", 19.77, 20.13, 19.72, 20.11),
+        ("2026-10-20", 19.99, 21.58, 19.96, 21.52), ("2026-10-21", 21.43, 21.44, 21.0, 21.04),
+        ("2026-10-22", 20.99, 21.39, 20.9, 21.01), ("2026-10-23", 20.76, 23.11, 20.73, 23.11),
+        ("2026-10-26", 22.98, 23.88, 22.85, 23.52), ("2026-10-27", 23.64, 23.93, 23.11, 23.11),
+        ("2026-10-28", 23.36, 23.64, 22.76, 23.2), ("2026-10-29", 22.89, 23.1, 22.19, 22.5),
+        ("2026-10-30", 22.41, 22.95, 22.08, 22.12), ("2026-11-02", 22.35, 22.73, 21.6, 22.49),
+        ("2026-11-03", 22.23, 23.62, 22.17, 22.38), ("2026-11-04", 22.5, 23.66, 22.38, 23.63),
+        ("2026-11-05", 23.58, 25.4, 23.56, 24.89), ("2026-11-06", 24.4, 25.06, 24.3, 24.61),
+        ("2026-11-09", 24.99, 25.57, 24.4, 24.74), ("2026-11-10", 24.85, 26.48, 24.24, 25.69),
+        ("2026-11-11", 25.12, 25.44, 24.74, 25.14), ("2026-11-12", 25.06, 25.1, 24.51, 24.66),
+        ("2026-11-13", 24.66, 24.9, 24.01, 24.2),
+    ];
+
+    /// `PIT_EXAMPLE` as candles, up to and including `as_of`.
+    fn pit_example(as_of: &str) -> Vec<Candle> {
+        PIT_EXAMPLE
+            .iter()
+            .filter(|row| row.0 <= as_of)
+            .map(|&(date, open, high, low, close)| Candle {
+                timestamp: date.to_string(),
+                open,
+                close,
+                high,
+                low,
+                volume: 100.0,
+                amount: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pit_found_whether_the_turn_is_sharp_or_slow() {
+        let near = |a: f64, b: f64, tolerance: f64| (a - b).abs() < tolerance;
+
+        let pits = find_pit_structures(&candles_from_closes(&pit_closes(PIT_SHARP)));
+        assert_eq!(pits.len(), 1, "{pits:?}");
+        let p = &pits[0];
+        // The box is the 72 bars of runs plus the top of the drop: it ends
+        // on the last close that stands clear of everything after it.
+        assert_eq!((p.shape.start, p.shape.box_end, p.shape.low, p.shape.end), (30, 107, 114, 128));
+        assert_eq!((p.box_len, p.under, p.len), (78, 15, 14));
+        // Floor and top are closes, wobble included: 10.04 to 11.09.
+        assert!(near(p.shape.floor, 10.044, 0.001) && near(p.shape.top, 11.088, 0.001), "{p:?}");
+        assert!(near(p.amp, 10.4, 0.1), "{p:?}");
+        assert!(near(p.drop, 8.45, 0.1), "{p:?}");
+        assert!(near(p.up, 16.2, 0.1), "{p:?}");
+        assert!(near(p.pos, 61.4, 0.5), "{p:?}");
+
+        // The same box and the same low; only the way back differs.
+        let pits = find_pit_structures(&candles_from_closes(&pit_closes(PIT_SLOW)));
+        assert_eq!(pits.len(), 1, "{pits:?}");
+        let p = &pits[0];
+        assert_eq!((p.shape.start, p.shape.box_end, p.shape.low, p.shape.end), (30, 107, 114, 146));
+        assert_eq!((p.box_len, p.under, p.len), (78, 25, 32));
+        assert!(near(p.drop, 7.86, 0.1) && near(p.up, 14.4, 0.1) && near(p.pos, 51.7, 0.5), "{p:?}");
+    }
+
+    #[test]
+    fn pit_waits_for_the_floor_to_be_taken_back() {
+        let closes = pit_closes(PIT_SHARP);
+        let found = |cut: usize| {
+            let candles = candles_from_closes(&closes[..closes.len() - cut]);
+            !find_pit_structures(&candles).is_empty()
+        };
+        // Through the drop, the eight bars at the bottom and the first half
+        // of the climb there is nothing: the breakdown still stands.
+        for cut in 5..=26 {
+            assert!(!found(cut), "{cut} bars before the end");
+        }
+        // From the first close back above the box's floor it is in force.
+        for cut in 0..=4 {
+            assert!(found(cut), "{cut} bars before the end");
+        }
+    }
+
+    #[test]
+    fn pit_rejects_shapes_that_only_resemble_it() {
+        let found = |closes: &[f64]| find_pit_structures(&candles_from_closes(closes)).len();
+        // The real thing.
+        assert_eq!(found(&pit_closes(PIT_SHARP)), 1);
+
+        // The box simply goes on: nothing broke.
+        assert_eq!(found(&pit_closes(&[(8, 10.0), (8, 11.0), (8, 10.5)])), 0);
+        // One long lower shadow through the floor, closing back inside.
+        let mut needle = candles_from_closes(&pit_closes(&[(8, 10.2), (8, 11.0), (8, 10.5)]));
+        let bar = needle.len() - 12;
+        needle[bar].low = 9.2;
+        assert!(find_pit_structures(&needle).is_empty());
+        // A dip of 1.5% under the floor: a couple of ordinary bars' worth.
+        assert_eq!(found(&pit_closes(&[(10, 9.85), (8, 9.87), (8, 10.6)])), 0);
+        // Out of the box at once, then forty bars of sliding under it: that
+        // is a decline, not a drop.
+        assert_eq!(found(&pit_closes(&[(4, 9.9), (40, 9.3), (8, 9.35), (8, 10.6)])), 0);
+
+        // Bounced, but still under the floor.
+        assert_eq!(found(&pit_closes(&[(10, 9.3), (8, 9.35), (8, 9.9)])), 0);
+        // Back above the floor in two bars, then thirty bars dead flat:
+        // 企稳 without 走强.
+        assert_eq!(found(&pit_closes(&[(10, 9.3), (2, 10.3), (30, 10.3)])), 0);
+        // Up to 11.3 and most of the way back: the rebound is being returned.
+        assert_eq!(found(&pit_closes(&[(10, 9.3), (8, 9.35), (8, 11.3), (8, 10.15)])), 0);
+        // Back inside and wandering there for forty more bars: the box has
+        // simply resumed, the pit is old news.
+        let resumed = [(10, 9.3), (8, 9.35), (8, 10.6), (15, 10.3), (15, 10.7), (10, 10.6)];
+        assert_eq!(found(&pit_closes(&resumed)), 0);
+
+        // One rise and one fall where the box should be: a mountain.
+        assert_eq!(found(&pit_closes_with(2, 36, 0.008, PIT_SHARP)), 0);
+        // Three long one-way legs with hardly a wobble: far too tall for
+        // what little noise there is.
+        assert_eq!(found(&pit_closes_with(3, 24, 0.0005, PIT_SHARP)), 0);
+        // A falling channel: the same swings, sliding 25% while they last
+        // (wobbling ±1.2%, which on a level box is still found).
+        let wobbly = pit_closes_with(9, 8, 0.012, PIT_SHARP);
+        assert_eq!(found(&wobbly), 1);
+        let channel: Vec<f64> = wobbly
+            .iter()
+            .enumerate()
+            .map(|(i, c)| c * (-0.25 * ((i as f64 - 30.0) / 72.0).clamp(0.0, 1.0)).exp())
+            .collect();
+        assert_eq!(found(&channel), 0);
+    }
+
+    #[test]
+    fn pit_rules_are_the_same_at_any_scale() {
+        let candles = candles_from_closes(&pit_closes(PIT_SHARP));
+        let bars = |candles: &[Candle]| {
+            let pits = find_pit_structures(candles);
+            assert_eq!(pits.len(), 1, "{pits:?}");
+            let p = &pits[0];
+            (p.shape.start, p.shape.box_end, p.shape.low, p.box_len, p.under, p.len)
+        };
+        let reshaped = |f: &dyn Fn(f64) -> f64| -> Vec<Candle> {
+            candles
+                .iter()
+                .map(|c| Candle {
+                    open: f(c.open),
+                    close: f(c.close),
+                    high: f(c.high),
+                    low: f(c.low),
+                    ..c.clone()
+                })
+                .collect()
+        };
+        let expected = bars(&candles);
+
+        // A sleepy stock and a wild one: the same path with every move
+        // halved, doubled or tripled is the same structure, bar for bar.
+        for (k, amp) in [(0.5, 5.07), (2.0, 21.87), (3.0, 34.54)] {
+            let scaled = reshaped(&|p| 10.0 * (p / 10.0_f64).powf(k));
+            assert_eq!(bars(&scaled), expected, "moves x{k}");
+            let found = find_pit_structures(&scaled)[0].amp;
+            assert!((found - amp).abs() < 0.05, "moves x{k}: box height {found}");
+        }
+        // So is the same path at a hundred times the price.
+        assert_eq!(bars(&reshaped(&|p| p * 100.0)), expected);
+
+        // And the same candles are the same structure on a weekly chart:
+        // here each one is spread over a week of five identical days.
+        let days: Vec<(f64, f64, f64, f64, f64)> = candles
+            .iter()
+            .flat_map(|c| std::iter::repeat((c.open, c.high, c.low, c.close, 100.0)).take(5))
+            .collect();
+        let dir = stock_dir_with_bars("chart_app_pit_weekly", &days);
+        let holds = |line: &str, periods: &[Period]| {
+            evaluate_filters_on_stock(&dir, &filter_lines(&[line]), &[], periods)
+        };
+        assert!(holds("week: pit_box >= 78 and pit_box <= 78 and pit_len <= 14", &[Period::Daily]));
+        assert!(holds("pit_box <= 78 and pit_len <= 14", &[Period::Weekly]));
+        // On the daily chart of those days it is the same structure again,
+        // five times as long.
+        assert!(holds("day: pit_box >= 380 and pit_len >= 70", &[Period::Daily]));
+        assert!(!holds("day: pit_box <= 78", &[Period::Daily]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pit_recognises_the_real_example() {
+        // Back above the floor on 2026-10-20, under it again for two days,
+        // then in force from 2026-10-23 on.
+        for as_of in ["2026-10-20", "2026-10-23", "2026-11-02", "2026-11-13"] {
+            let candles = pit_example(as_of);
+            let pits = find_pit_structures(&candles);
+            assert_eq!(pits.len(), 1, "as of {as_of}: {pits:?}");
+            let p = &pits[0];
+            assert_eq!(candles[p.shape.start].timestamp, "2026-07-09", "as of {as_of}");
+            assert_eq!(candles[p.shape.box_end].timestamp, "2026-10-09", "as of {as_of}");
+            assert_eq!(candles[p.shape.low].timestamp, "2026-10-15", "as of {as_of}");
+            assert_eq!(p.shape.end, candles.len() - 1);
+            assert_eq!(p.box_len, 61);
+            assert!((p.amp - 15.3).abs() < 0.1 && (p.drop - 8.75).abs() < 0.1, "{p:?}");
+        }
+        let latest = &find_pit_structures(&pit_example("2026-11-13"))[0];
+        assert_eq!((latest.under, latest.len), (8, 21));
+        assert!((latest.up - 24.1).abs() < 0.1 && (latest.pos - 86.5).abs() < 0.5, "{latest:?}");
+
+        // While the closes are under the floor there is no turn to speak of.
+        for as_of in ["2026-10-09", "2026-10-15", "2026-10-19", "2026-10-21", "2026-10-22"] {
+            let pits = find_pit_structures(&pit_example(as_of));
+            assert!(pits.is_empty(), "as of {as_of}: {pits:?}");
+        }
+    }
+
+    #[test]
+    fn pit_shape_locates_the_strokes_on_the_chart() {
+        let candles = pit_example("2026-11-13");
+        let draw = |line: &str| {
+            shapes_to_draw(&filter_lines(&[line]), &[Period::Daily], Period::Daily, &candles, &[])
+        };
+        let shapes = draw("pit_box >= 30");
+        assert!(shapes.arc.is_none() && !shapes.is_empty());
+        let pit = shapes.pit.expect("structure to draw");
+        let shape = &pit.shape;
+
+        // The box's edges are the lowest and the highest close inside it.
+        let in_box = &candles[shape.start..=shape.box_end];
+        let lowest = in_box.iter().map(|c| c.close).fold(f64::MAX, f64::min);
+        let highest = in_box.iter().map(|c| c.close).fold(f64::MIN, f64::max);
+        assert_eq!((lowest, highest), (21.37, 24.64));
+        assert!((shape.floor - lowest).abs() < 1e-9 && (shape.top - highest).abs() < 1e-9);
+        // The pit low is the lowest low since the box began, under the floor.
+        let low = candles[shape.low].low;
+        assert_eq!(low, 19.5);
+        assert!(candles[shape.start..].iter().all(|c| c.low >= low));
+        // The turn line climbs from just above the low to the latest closes,
+        // through the middle of the closes on the way.
+        let (first, last) = (shape.low, shape.end);
+        assert!((shape.turn_price(first as f64) - 20.46).abs() < 0.05);
+        assert!((shape.turn_price(last as f64) - 25.49).abs() < 0.05);
+        let above = (first..=last)
+            .filter(|&i| candles[i].close > shape.turn_price(i as f64))
+            .count();
+        assert_eq!((above, last - first + 1), (10, 22));
+
+        // Nothing to draw where the bundle has no pit line for the timeframe,
+        // where no structure meets it, or for a bundle without `pit_*`.
+        assert!(draw("week: pit_box >= 30").is_empty());
+        assert!(draw("pit_box >= 300").is_empty());
+        assert!(draw("close > 0").is_empty());
+    }
+
+    #[test]
+    fn pit_columns_parse_and_take_no_offset() {
+        assert!(parse_filter_line("pit_box >= 30 and pit_amp <= 40 and pit_pos <= 100").is_ok());
+        assert!(parse_filter_line("week: pit_drop >= 5 and pit_under >= 3").is_ok());
+        assert!(parse_filter_line("pit_up/pit_drop >= 1").is_ok());
+        assert!(parse_filter_line("pit_len[-1] <= 40").is_err());
+        assert!(parse_filter_line("pit_foo >= 4").is_err());
+    }
+
+    #[test]
+    fn pit_filter_binds_one_structure_per_line() {
+        // Two structures at once: a 126-bar box whose pit was 44 bars ago,
+        // and — once the price was back inside — a 23-bar shelf between 10.5
+        // and 11 with a pit of its own, 6 bars ago.
+        let mut after = vec![(10, 9.3), (6, 9.35), (6, 10.6)];
+        after.extend((0..6).map(|k| (4, if k % 2 == 0 { 10.9 } else { 10.5 })));
+        after.extend([(3, 9.9), (3, 9.93), (4, 10.7)]);
+        let candles = candles_from_closes(&pit_closes_with(15, 8, 0.008, &after));
+        let pits = find_pit_structures(&candles);
+        let found: Vec<_> = pits.iter().map(|p| (p.box_len, p.len)).collect();
+        assert_eq!(found, [(126, 44), (23, 6)], "{pits:?}"); // longest box first
+
+        let dir = stock_dir_with_candles("chart_app_pit_filter", &candles);
+        let holds = |lines: &[&str]| {
+            evaluate_filters_on_stock(&dir, &filter_lines(lines), &[], &[Period::Daily])
+        };
+        assert!(holds(&["pit_box >= 100"]));
+        assert!(holds(&["pit_len <= 10"]));
+        // On one line both conditions must be met by the same structure…
+        assert!(!holds(&["pit_box >= 100 and pit_len <= 10"]));
+        // …while separate lines may each be met by a different one.
+        assert!(holds(&["pit_box >= 100", "pit_len <= 10"]));
+        // Columns can be set against each other: only the young pit has yet
+        // to regain as much as it lost (in %, up from the low vs down to it).
+        assert!(holds(&["pit_up/pit_drop < 1.5 and pit_len <= 10"]));
+        assert!(!holds(&["pit_up/pit_drop < 1.5 and pit_box >= 100"]));
+
+        // The chart marks the structure that meets the bundle's lines.
+        let drawn = |line: &str| {
+            pit_to_draw(&filter_lines(&[line]), &[Period::Daily], Period::Daily, &candles, &[])
+                .map(|p| p.box_len)
+        };
+        assert_eq!(drawn("pit_box >= 20"), Some(126));
+        assert_eq!(drawn("pit_len <= 10"), Some(23));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pit_columns_are_unresolved_without_a_structure() {
+        // A box that never breaks has nothing for `pit_*` to describe:
+        // comparisons are false either way round.
+        let closes = pit_closes(&[(8, 10.0), (8, 11.0), (8, 10.5)]);
+        let dir = stock_dir_with_candles("chart_app_pit_none", &candles_from_closes(&closes));
+        let holds = |line: &str| {
+            evaluate_filters_on_stock(&dir, &filter_lines(&[line]), &[], &[Period::Daily])
+        };
+        assert!(!holds("pit_box >= 1"));
+        assert!(!holds("pit_box < 1"));
+        // …which still lets an `or` branch carry the line, also next to the
+        // other family of structure columns.
+        assert!(holds("pit_box >= 1 or close > ma20"));
+        assert!(holds("pit_box >= 1 or arc_len >= 1 or close > ma20"));
+        assert!(!holds("pit_box >= 1 or arc_len >= 1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pit_preset_finds_the_example_once_it_is_back_inside() {
+        let matches = |test: &str, as_of: &str| {
+            let dir = stock_dir_with_candles(test, &pit_example(as_of));
+            let bundle = preset("下破变脸");
+            let lines = parse_filter_lines(&bundle.filters).unwrap();
+            let hit = evaluate_filters_on_stock(&dir, &lines, &[], &bundle.periods);
+            let _ = std::fs::remove_dir_all(&dir);
+            hit
+        };
+        assert!(matches("chart_app_pit_preset_in", "2026-11-13"));
+        assert!(!matches("chart_app_pit_preset_under", "2026-10-19"));
+        // The bundle scans both timeframes with one unprefixed line.
+        assert_eq!(preset("下破变脸").periods, [Period::Daily, Period::Weekly]);
     }
 }

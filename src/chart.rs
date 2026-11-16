@@ -1,4 +1,4 @@
-use crate::data::{ArcStructure, Candle, MaLine, TradeAgentResult};
+use crate::data::{ArcStructure, Candle, MaLine, MatchedShapes, PitStructure, TradeAgentResult};
 use eframe::egui::*;
 
 // TradingView dark theme colors
@@ -15,6 +15,10 @@ const LABEL_BG: Color32 = Color32::from_rgb(0x36, 0x3a, 0x45);
 const ARC_COLOR: Color32 = Color32::from_rgb(0xff, 0xd5, 0x4f);
 const ARC_CENTRE_COLOR: Color32 = Color32::from_rgb(0x64, 0xb5, 0xf6);
 const ARC_RALLY_COLOR: Color32 = Color32::from_rgb(0xec, 0xef, 0xf1);
+// Pit-structure overlay: the turn line, the box, the pit low.
+const PIT_TURN_COLOR: Color32 = ARC_COLOR;
+const PIT_BOX_COLOR: Color32 = ARC_CENTRE_COLOR;
+const PIT_LOW_COLOR: Color32 = ARC_RALLY_COLOR;
 
 const PRICE_AXIS_WIDTH: f32 = 85.0;
 const TIME_AXIS_HEIGHT: f32 = 28.0;
@@ -101,8 +105,9 @@ pub fn ma_color(period: usize) -> Color32 {
 /// price guide lines — e.g. 0.2 for 20 %-per-line on daily charts, 0.3 on
 /// weekly charts.
 ///
-/// `arc` is an arc structure found in `candles` (see `data::ArcStructure`) to
-/// mark on the chart, so a stock picked by an `arc_*` filter shows why.
+/// `shapes` are the structures found in `candles` (see `data::ArcStructure`,
+/// `data::PitStructure`) to mark on the chart, so a stock picked by an `arc_*`
+/// or `pit_*` filter shows why.
 pub fn draw_chart(
     ui: &mut Ui,
     candles: &[Candle],
@@ -111,7 +116,7 @@ pub fn draw_chart(
     state: &mut ChartState,
     title: &str,
     price_level_step: f64,
-    arc: Option<&ArcStructure>,
+    shapes: &MatchedShapes,
 ) {
     if candles.is_empty() {
         ui.centered_and_justified(|ui| {
@@ -179,9 +184,15 @@ pub fn draw_chart(
     // Candles
     draw_candles(&clipped, candles, state, &chart_rect);
 
-    // Arc structure (above candles, so its markers stay readable)
-    if let Some(arc) = arc {
-        draw_arc(&clipped, candles, arc, state, &chart_rect);
+    // Structures (above candles, so their markers stay readable), each with
+    // a one-line summary top-right.
+    let mut summary_y = chart_rect.min.y + 8.0;
+    if let Some(arc) = &shapes.arc {
+        draw_arc(&clipped, candles, arc, state, &chart_rect, summary_y);
+        summary_y += 18.0;
+    }
+    if let Some(pit) = &shapes.pit {
+        draw_pit(&clipped, candles, pit, state, &chart_rect, summary_y);
     }
 
     // Current price line
@@ -1169,6 +1180,7 @@ fn draw_arc(
     arc: &ArcStructure,
     state: &ChartState,
     rect: &Rect,
+    summary_y: f32,
 ) {
     let shape = &arc.shape;
     // The structure was found in an earlier load of this stock; if the data
@@ -1207,7 +1219,7 @@ fn draw_arc(
 
     // What the strokes add up to.
     painter.text(
-        pos2(rect.max.x - 10.0, rect.min.y + 8.0),
+        pos2(rect.max.x - 10.0, summary_y),
         Align2::RIGHT_TOP,
         format!(
             "越振越强: 起涨 {:+.0}% (至最高点 {:+.0}%) · 重心抬高 {:+.0}% · 底部抬高 {:+.0}% · 震幅约 {:.0}% · 距高点 {:+.0}%",
@@ -1215,6 +1227,75 @@ fn draw_arc(
         ),
         FontId::proportional(12.0),
         ARC_COLOR,
+    );
+}
+
+/// Marks a pit structure with its three strokes: the box (blue, its floor
+/// carried on as a dashed line to the latest bar), the pit low (white, 坑底)
+/// and the line through the closes since then (yellow).
+fn draw_pit(
+    painter: &Painter,
+    candles: &[Candle],
+    pit: &PitStructure,
+    state: &ChartState,
+    rect: &Rect,
+    summary_y: f32,
+) {
+    let shape = &pit.shape;
+    // As in `draw_arc`: found in an earlier load of this stock, so make sure
+    // it still points at bars that exist, in order.
+    if shape.end >= candles.len()
+        || !(shape.start < shape.box_end && shape.box_end < shape.low && shape.low < shape.end)
+    {
+        return;
+    }
+    let x = |bar: f64| idx_to_x(bar, state, rect);
+    let y = |price: f64| price_to_y(price, state, rect);
+
+    // The box, from the left edge of its first candle to the right edge of
+    // its last.
+    let box_rect = Rect::from_min_max(
+        pos2(x(shape.start as f64), y(shape.top)),
+        pos2(x(shape.box_end as f64 + 1.0), y(shape.floor)),
+    );
+    painter.rect_filled(box_rect, 0.0, PIT_BOX_COLOR.gamma_multiply(0.1));
+    painter.rect_stroke(box_rect, 0.0, Stroke::new(1.0, PIT_BOX_COLOR));
+    // Its floor, carried on: the line the price fell through and took back.
+    draw_dashed_line_h(
+        painter,
+        box_rect.max.x,
+        x(shape.end as f64 + 1.0),
+        box_rect.max.y,
+        PIT_BOX_COLOR,
+        1.0,
+    );
+
+    // The pit low.
+    let low = pos2(x(shape.low as f64 + 0.5), y(candles[shape.low].low));
+    painter.circle_filled(low + vec2(0.0, 8.0), 3.5, PIT_LOW_COLOR);
+    painter.text(
+        low + vec2(0.0, 14.0),
+        Align2::CENTER_TOP,
+        "坑底",
+        FontId::proportional(11.0),
+        PIT_LOW_COLOR,
+    );
+
+    // The turn: the line through the closes since the low.
+    let turn: Vec<Pos2> = (shape.low..=shape.end)
+        .map(|bar| pos2(x(bar as f64 + 0.5), y(shape.turn_price(bar as f64))))
+        .collect();
+    painter.add(Shape::line(turn, Stroke::new(2.0, PIT_TURN_COLOR)));
+
+    painter.text(
+        pos2(rect.max.x - 10.0, summary_y),
+        Align2::RIGHT_TOP,
+        format!(
+            "下破变脸: 横盘 {} 根 (箱高 {:.0}%) · 跌破箱底 {:.0}% ({} 根收在箱下) · 坑底至今 {} 根 {:+.0}% · 箱内位置 {:.0}",
+            pit.box_len, pit.amp, pit.drop, pit.under, pit.len, pit.up, pit.pos
+        ),
+        FontId::proportional(12.0),
+        PIT_TURN_COLOR,
     );
 }
 
