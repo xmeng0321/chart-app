@@ -55,20 +55,10 @@ fn filtered_key(filter_name: Option<&str>) -> String {
         .to_string()
 }
 
-pub fn load_filtered(filter_name: Option<&str>) -> Vec<String> {
-    let path = filtered_path();
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-
-    match serde_json::from_str::<FilteredStore>(&content) {
-        Ok(FilteredStore::ByName(by_name)) => by_name
-            .get(&filtered_key(filter_name))
-            .cloned()
-            .unwrap_or_default(),
-        Ok(FilteredStore::Legacy(filtered)) => filtered,
-        Err(_) => Vec::new(),
-    }
+/// Every bundle's cached matches, by bundle name. A bundle without an entry
+/// has not been run since it was created or its conditions last changed.
+pub fn load_all_filtered() -> HashMap<String, Vec<String>> {
+    read_filtered_store(&filtered_path()).unwrap_or_default()
 }
 
 pub fn save_filtered(filter_name: Option<&str>, filtered: &[String]) {
@@ -127,9 +117,10 @@ fn write_filtered_store(path: &Path, by_name: &HashMap<String, Vec<String>>) {
 
 // ── Last-selected stock per tab persistence ──
 //
-// The UI has multiple stock tabs (全部/自选/筛选). When the user switches tabs
+// The UI has multiple stock tabs (全部, 自选, one per filter bundle). When the user switches tabs
 // or reopens the app, we restore the stock they were last viewing on that tab.
-// Keys are tab identifiers ("all", "favorites", "filtered"); values are secids.
+// Keys are tab identifiers: "all", "favorites", and one per filter bundle's
+// tab ("filtered:<bundle name>"). Values are secids.
 
 pub fn last_selected_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -160,8 +151,9 @@ pub fn save_last_selected(last: &HashMap<String, String>) {
 
 // ── Selected filter persistence ──
 //
-// Remembers which named filter (from `settings.data_filters[].name`) the user
-// last picked in the Filtered tab dropdown so it can be restored next launch.
+// Remembers which filter bundle (`settings.data_filters[].name`) is in focus
+// (see `ChartApp::focus_filter`) — the one whose tab is open, or was open
+// last — so it can be restored next launch.
 
 pub fn selected_filter_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -220,8 +212,8 @@ fn default_filter_periods() -> Vec<Period> {
     vec![Period::Daily]
 }
 
-/// A named bundle of filter lines, edited in the Filtered tab and picked from
-/// the dropdown by name. All lines in `filters` must hold for a stock to match.
+/// A named bundle of filter lines. Each has a tab of its own in the left
+/// panel. All lines in `filters` must hold for a stock to match.
 ///
 /// Each line may pin its own timeframe with a `day:` / `week:` prefix.
 /// `periods` is the fallback for lines without a prefix: such a line passes if
@@ -237,7 +229,7 @@ pub struct NamedFilter {
 
 impl NamedFilter {
     /// Timeframes this bundle actually reads, for the `[日]` / `[周]` /
-    /// `[日+周]` badge next to the picker. Unparsable lines are ignored — the
+    /// `[日+周]` badge next to its name. Unparsable lines are ignored — the
     /// editor reports those separately.
     pub fn active_periods(&self) -> Vec<Period> {
         let defaults = if self.periods.is_empty() {
@@ -294,10 +286,10 @@ fn default_data_filters() -> Vec<NamedFilter> {
 // just started to return.
 //
 // 下破变脸: the pit structures below (`pit_*`), on either timeframe — a box,
-// a break below it, the floor taken back. It finds a shape and promises
-// nothing: a rough check of its daily picks (every 5th session, 2019–2026)
-// showed no higher rate of bursts than the market and at most a small edge
-// in 20-bar return.
+// a break below it, the floor taken back — in a stock that is above its
+// 100-day average. It finds a shape and promises nothing: a rough check of
+// its daily picks (every 5th session, 2019–2026) showed about the market's
+// rate of bursts and no dependable edge in 20-bar return.
 //
 // All are plain filter lines, so the thresholds can be tuned in the editor.
 
@@ -342,6 +334,8 @@ const PRESET_PIT: &[&str] = &[
     "# 下面这行: 至少横盘 30 根, 箱体高度不超过 40%, 坑底在 40 根以内, 还没有涨出箱顶",
     "# 可选加严: pit_box >= 60 (横盘更久)  pit_amp <= 25 (箱体更窄)  pit_under >= 5 (不是一两天的假摔)  pit_pos <= 50 (刚收回箱底)",
     "pit_box >= 30 and pit_amp <= 40 and pit_len <= 40 and pit_pos <= 100",
+    "# 现价在 100 日均线之上 (均线周期可改, 例如 ma60 / ma120 / ma250; 不需要就删掉这一行)",
+    "day: close > ma100",
 ];
 
 /// Ready-made bundles: offered in the editor's 新建 dialog, and runnable by
@@ -2127,31 +2121,49 @@ pub fn evaluate_filters_on_stock(
     })
 }
 
-/// The structures to mark on a chart of `period` for a stock a bundle matched,
-/// so the chart shows why it was picked.
+/// The structures to mark on a chart of `period` for a stock in a bundle's
+/// list, so the chart shows why it was picked.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MatchedShapes {
     pub arc: Option<ArcStructure>,
     pub pit: Option<PitStructure>,
+    /// The stock no longer meets the bundle: its list is what the last scan
+    /// found, and the data has moved on since (a sync brought newer bars).
+    /// The structures are then the ones it was most likely picked for, and
+    /// the chart says so.
+    pub stale: bool,
 }
 
 impl MatchedShapes {
+    /// Whether there is a structure to mark on this timeframe.
+    pub fn has_structure(&self) -> bool {
+        self.arc.is_some() || self.pit.is_some()
+    }
+
+    /// Nothing to show at all: no structure, and no reason to explain why.
     pub fn is_empty(&self) -> bool {
-        self.arc.is_none() && self.pit.is_none()
+        !self.has_structure() && !self.stale
     }
 }
 
 /// Both kinds of structure to draw: see `arc_to_draw` and `pit_to_draw`.
+/// `still_matches` says whether the stock meets the bundle on the data as it
+/// is now (`evaluate_filters_on_stock`). When it does not, the structures need
+/// not meet the bundle's lines either — the stock is listed, so one of them is
+/// what it was picked for before the data moved on.
 pub fn shapes_to_draw(
     lines: &[FilterLine],
     default_periods: &[Period],
     period: Period,
     candles: &[Candle],
     ma_lines: &[MaLine],
+    still_matches: bool,
 ) -> MatchedShapes {
+    let unmet = !still_matches;
     MatchedShapes {
-        arc: arc_to_draw(lines, default_periods, period, candles, ma_lines),
-        pit: pit_to_draw(lines, default_periods, period, candles, ma_lines),
+        arc: arc_to_draw(lines, default_periods, period, candles, ma_lines, unmet),
+        pit: pit_to_draw(lines, default_periods, period, candles, ma_lines, unmet),
+        stale: unmet,
     }
 }
 
@@ -2159,13 +2171,16 @@ pub fn shapes_to_draw(
 /// matched: one that satisfies the bundle's `arc_*` lines on that timeframe,
 /// preferring the longest. `None` when the bundle has
 /// no `arc_*` line for this timeframe or nothing qualifies there (the stock
-/// may have matched on the other timeframe, or the data has changed since).
+/// may have matched on the other timeframe). With `allow_unmet`, a structure
+/// that meets none of those lines still counts, the one meeting the most
+/// being preferred.
 pub fn arc_to_draw(
     lines: &[FilterLine],
     default_periods: &[Period],
     period: Period,
     candles: &[Candle],
     ma_lines: &[MaLine],
+    allow_unmet: bool,
 ) -> Option<ArcStructure> {
     let lines = lines_reading(lines, default_periods, period, FilterExpr::uses_arc);
     if lines.is_empty() || candles.is_empty() {
@@ -2178,7 +2193,7 @@ pub fn arc_to_draw(
     find_arc_structures(candles)
         .into_iter()
         .map(|arc| (satisfied(&arc), arc))
-        .filter(|(n, _)| *n > 0)
+        .filter(|(n, _)| *n > 0 || allow_unmet)
         .max_by_key(|(n, arc)| (*n, arc.len))
         .map(|(_, arc)| arc)
 }
@@ -2191,6 +2206,7 @@ pub fn pit_to_draw(
     period: Period,
     candles: &[Candle],
     ma_lines: &[MaLine],
+    allow_unmet: bool,
 ) -> Option<PitStructure> {
     let lines = lines_reading(lines, default_periods, period, FilterExpr::uses_pit);
     if lines.is_empty() || candles.is_empty() {
@@ -2203,7 +2219,7 @@ pub fn pit_to_draw(
     find_pit_structures(candles)
         .into_iter()
         .map(|pit| (satisfied(&pit), pit))
-        .filter(|(n, _)| *n > 0)
+        .filter(|(n, _)| *n > 0 || allow_unmet)
         .max_by_key(|(n, pit)| (*n, pit.box_len))
         .map(|(_, pit)| pit)
 }
@@ -2405,9 +2421,10 @@ fn resolve_single_value(ctx: &FilterContext<'_>, operand: &FilterOperand) -> Opt
 
 // ── Filter progress types ──
 
+/// The state of one bundle's scan, shown on its tab. A
+/// bundle that has not been run this session has none.
 #[derive(Clone)]
 pub enum FilterStatus {
-    Idle,
     /// Conditions were edited since the last run, so the cached match list was
     /// dropped — the tab must not show results that predate the edit.
     Stale,
@@ -2432,7 +2449,8 @@ pub enum FilterMessage {
         matched: usize,
         stock_label: String,
     },
-    Finished(Result<(usize, usize), String>),
+    /// The matched secids, sorted, and the number of stocks scanned.
+    Finished(Result<(Vec<String>, usize), String>),
 }
 
 #[cfg(test)]
@@ -3519,7 +3537,7 @@ mod tests {
     fn arc_shape_locates_the_strokes_on_the_chart() {
         let candles = arc_example("2024-03-29");
         let lines = filter_lines(&["arc_len >= 40"]);
-        let arc = arc_to_draw(&lines, &[Period::Daily], Period::Daily, &candles, &[])
+        let arc = arc_to_draw(&lines, &[Period::Daily], Period::Daily, &candles, &[], false)
             .expect("structure to draw");
         let shape = &arc.shape;
         let (first, last) = (shape.top + 1, shape.end);
@@ -3550,7 +3568,8 @@ mod tests {
         // Nothing to draw where the bundle has no arc line for the timeframe,
         // where no structure meets it, or for a bundle without `arc_*`.
         let draw = |line: &str| {
-            arc_to_draw(&filter_lines(&[line]), &[Period::Daily], Period::Daily, &candles, &[])
+            let lines = filter_lines(&[line]);
+            arc_to_draw(&lines, &[Period::Daily], Period::Daily, &candles, &[], false)
         };
         assert!(draw("week: arc_len >= 40").is_none());
         assert!(draw("arc_len >= 400").is_none());
@@ -3928,7 +3947,8 @@ mod tests {
     fn pit_shape_locates_the_strokes_on_the_chart() {
         let candles = pit_example("2026-11-13");
         let draw = |line: &str| {
-            shapes_to_draw(&filter_lines(&[line]), &[Period::Daily], Period::Daily, &candles, &[])
+            let lines = filter_lines(&[line]);
+            shapes_to_draw(&lines, &[Period::Daily], Period::Daily, &candles, &[], true)
         };
         let shapes = draw("pit_box >= 30");
         assert!(shapes.arc.is_none() && !shapes.is_empty());
@@ -3960,6 +3980,48 @@ mod tests {
         assert!(draw("week: pit_box >= 30").is_empty());
         assert!(draw("pit_box >= 300").is_empty());
         assert!(draw("close > 0").is_empty());
+    }
+
+    #[test]
+    fn shapes_are_still_drawn_for_a_listed_stock_that_left_the_filter() {
+        // A bundle's list is what its last scan found. Here the stock was
+        // picked while its close sat low in the box; by 2026-11-13 it has
+        // climbed to 86% of the way up, past the bundle's `pit_pos <= 50`.
+        let lines = filter_lines(&["pit_box >= 30 and pit_pos <= 50"]);
+        let daily = &[Period::Daily];
+        let candles = pit_example("2026-11-13");
+        let dir = stock_dir_with_candles("chart_app_pit_stale", &candles);
+        let still_matches = evaluate_filters_on_stock(&dir, &lines, &[], daily);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!still_matches);
+
+        // The structure it was picked for is drawn all the same, and flagged.
+        let shapes = shapes_to_draw(&lines, daily, Period::Daily, &candles, &[], still_matches);
+        assert!(shapes.stale && shapes.has_structure() && !shapes.is_empty());
+        assert_eq!(shapes.pit.as_ref().map(|p| p.box_len), Some(61));
+        // Were it still a match, a structure outside the conditions would
+        // not be: it is not what the bundle is showing.
+        let shapes = shapes_to_draw(&lines, daily, Period::Daily, &candles, &[], true);
+        assert!(!shapes.stale && shapes.is_empty());
+
+        // Where there is no structure at all only the flag is left — enough
+        // for the chart to say why it marks nothing.
+        let early = pit_example("2026-10-19"); // still under the floor
+        let shapes = shapes_to_draw(&lines, daily, Period::Daily, &early, &[], false);
+        assert!(shapes.stale && !shapes.has_structure() && !shapes.is_empty());
+
+        // Of several structures, the one that meets the most lines is the
+        // likeliest reason; failing that, the longest.
+        let mut after = vec![(10, 9.3), (6, 9.35), (6, 10.6)];
+        after.extend((0..6).map(|k| (4, if k % 2 == 0 { 10.9 } else { 10.5 })));
+        after.extend([(3, 9.9), (3, 9.93), (4, 10.7)]);
+        let two = candles_from_closes(&pit_closes_with(15, 8, 0.008, &after)); // boxes of 126 and 23
+        let drawn = |exprs: &[&str]| {
+            pit_to_draw(&filter_lines(exprs), daily, Period::Daily, &two, &[], true)
+                .map(|p| p.box_len)
+        };
+        assert_eq!(drawn(&["pit_box <= 30", "pit_len >= 400"]), Some(23));
+        assert_eq!(drawn(&["pit_box >= 400"]), Some(126));
     }
 
     #[test]
@@ -4001,7 +4063,8 @@ mod tests {
 
         // The chart marks the structure that meets the bundle's lines.
         let drawn = |line: &str| {
-            pit_to_draw(&filter_lines(&[line]), &[Period::Daily], Period::Daily, &candles, &[])
+            let lines = filter_lines(&[line]);
+            pit_to_draw(&lines, &[Period::Daily], Period::Daily, &candles, &[], false)
                 .map(|p| p.box_len)
         };
         assert_eq!(drawn("pit_box >= 20"), Some(126));
@@ -4044,5 +4107,38 @@ mod tests {
         assert!(!matches("chart_app_pit_preset_under", "2026-10-19"));
         // The bundle scans both timeframes with one unprefixed line.
         assert_eq!(preset("下破变脸").periods, [Period::Daily, Period::Weekly]);
+
+        // It also wants the close above the 100-day average. Here the same
+        // candles follow sixty days at 40: on 2026-11-13 those are more than
+        // a hundred bars back and change nothing, but on 2026-10-23 — when
+        // the structure is already in force — a dozen of them still hold the
+        // average above the price.
+        let after_a_fall = |as_of: &str| -> Vec<Candle> {
+            let high = Candle {
+                timestamp: "2026-01-01".to_string(),
+                open: 40.0,
+                close: 40.0,
+                high: 40.0,
+                low: 40.0,
+                volume: 100.0,
+                amount: None,
+            };
+            std::iter::repeat(high).take(60).chain(pit_example(as_of)).collect()
+        };
+        let holds = |test: &str, as_of: &str, lines: &[&str]| {
+            let dir = stock_dir_with_candles(test, &after_a_fall(as_of));
+            let periods = [Period::Daily, Period::Weekly];
+            let hit = evaluate_filters_on_stock(&dir, &filter_lines(lines), &[], &periods);
+            let _ = std::fs::remove_dir_all(&dir);
+            hit
+        };
+        let bundle = preset("下破变脸");
+        let all: Vec<&str> = bundle.filters.iter().map(String::as_str).collect();
+        let shape_only: Vec<&str> =
+            all.iter().copied().filter(|l| !l.contains("ma100")).collect();
+        assert_eq!(all.len(), shape_only.len() + 1);
+        assert!(holds("chart_app_pit_preset_ma_ok", "2026-11-13", &all));
+        assert!(holds("chart_app_pit_preset_shape", "2026-10-23", &shape_only));
+        assert!(!holds("chart_app_pit_preset_ma_low", "2026-10-23", &all));
     }
 }

@@ -47,6 +47,8 @@ const FILTER_SYNTAX_HELP: &str = "\
     同一行里的 pit_* 指同一段走势, 多个条件请用 and 写在一行, 例如
     pit_box >= 30 and pit_amp <= 40 and pit_len <= 40 and pit_pos <= 100";
 
+/// The kind of list in the left panel. There is one `Filtered` tab per filter
+/// bundle; which of them is open is `ChartApp::selected_filter_name`.
 #[derive(Clone, Copy, PartialEq)]
 enum StockTab {
     All,
@@ -73,7 +75,7 @@ impl StockTab {
     }
 }
 
-/// State of the filter editor dialog (筛选 tab → 编辑 / 新建).
+/// State of the filter editor dialog (a bundle's tab → 编辑, or the + tab).
 struct FilterEditor {
     /// Bundle being edited; `None` when creating a new one.
     original_name: Option<String>,
@@ -137,9 +139,60 @@ enum EditorAction {
     Close,
 }
 
+/// What a click on a row of a stock list asks for.
+enum RowClick {
+    Select,
+    ToggleFavorite,
+}
+
+/// Key in `last_selected.json` for the stock last viewed in a bundle's list.
+fn filter_selection_key(bundle: &str) -> String {
+    format!("{}:{}", StockTab::Filtered.key(), bundle)
+}
+
+/// Whether a stock passes the search box. `search_lower` is `search`
+/// lowercased, computed once per list rather than once per row.
+fn matches_search(info: &StockInfo, search: &str, search_lower: &str) -> bool {
+    search_lower.is_empty()
+        || info.code.to_lowercase().contains(search_lower)
+        || info.name.contains(search)
+        || info.secid.to_lowercase().contains(search_lower)
+}
+
+/// One row of a stock list: the favourite star and the stock itself.
+/// `scroll_to` brings the row into view.
+fn stock_row(
+    ui: &mut egui::Ui,
+    info: &StockInfo,
+    is_fav: bool,
+    selected: bool,
+    scroll_to: bool,
+) -> Option<RowClick> {
+    let (star, star_color) = if is_fav {
+        ("★", egui::Color32::from_rgb(0xFF, 0xD7, 0x00))
+    } else {
+        ("☆", egui::Color32::from_rgb(0x55, 0x55, 0x55))
+    };
+    let mut click = None;
+    ui.horizontal(|ui| {
+        let star = egui::RichText::new(star).color(star_color).size(14.0);
+        if ui.add(egui::Button::new(star).frame(false)).clicked() {
+            click = Some(RowClick::ToggleFavorite);
+        }
+        let stock = ui.selectable_label(selected, format!("{} {}", info.secid, info.name));
+        if stock.clicked() {
+            click = Some(RowClick::Select);
+        }
+        if scroll_to {
+            stock.scroll_to_me(Some(egui::Align::Center));
+        }
+    });
+    click
+}
+
 /// Everything the structure overlay depends on: the stock, its timeframe and
 /// bar count (a sync appends bars), and the filter bundle in force — `None`
-/// outside the Filtered tab, where nothing is drawn.
+/// outside a filter bundle's tab, where nothing is drawn.
 type OverlayKey = (Option<usize>, Period, usize, Option<String>);
 
 struct ChartApp {
@@ -160,11 +213,17 @@ struct ChartApp {
     favorites: Vec<String>,
     sync_status: SyncStatus,
     sync_receiver: Option<mpsc::Receiver<SyncMessage>>,
-    filtered: Vec<String>,
-    filter_status: FilterStatus,
-    filter_receiver: Option<mpsc::Receiver<FilterMessage>>,
-    /// Name of the currently picked filter bundle from `settings.data_filters`.
-    /// Persisted across launches so the dropdown reopens to the same choice.
+    /// Cached matches of every filter bundle, by bundle name (what
+    /// `filtered.json` holds). A bundle without an entry has not been run
+    /// since it was created or its conditions last changed.
+    filtered: HashMap<String, Vec<String>>,
+    /// Each bundle is run, and reports, on its own: the status line of its
+    /// tab, and the channel of its scan while one runs.
+    filter_status: HashMap<String, FilterStatus>,
+    filter_receivers: HashMap<String, mpsc::Receiver<FilterMessage>>,
+    /// The bundle in focus: the one whose tab is open, or was open last.
+    /// On its tab, arrow keys walk its list and the chart marks the
+    /// structures it matched. Persisted across launches.
     selected_filter_name: Option<String>,
     /// Open filter editor dialog, if any.
     filter_editor: Option<FilterEditor>,
@@ -202,13 +261,12 @@ impl ChartApp {
         let stocks = load_stock_list(&data_dir);
         let favorites = load_favorites();
         let last_selected_by_tab = load_last_selected();
-        // Restore the previously chosen filter name, falling back to the first
-        // available bundle so the dropdown always has a valid selection when
-        // any filters are configured.
+        // Restore the bundle last in focus, falling back to the first one so
+        // there is always a focus when any filters are configured.
         let selected_filter_name = load_selected_filter()
             .filter(|n| settings.data_filters.iter().any(|f| &f.name == n))
             .or_else(|| settings.data_filters.first().map(|f| f.name.clone()));
-        let filtered = load_filtered(selected_filter_name.as_deref());
+        let filtered = load_all_filtered();
         let mut app = Self {
             stocks,
             search: String::new(),
@@ -228,8 +286,8 @@ impl ChartApp {
             sync_status: SyncStatus::Idle,
             sync_receiver: None,
             filtered,
-            filter_status: FilterStatus::Idle,
-            filter_receiver: None,
+            filter_status: HashMap::new(),
+            filter_receivers: HashMap::new(),
             selected_filter_name,
             filter_editor: None,
             overlay: MatchedShapes::default(),
@@ -249,19 +307,38 @@ impl ChartApp {
         app
     }
 
-    fn reload_filtered_for_selected_filter(&mut self) {
-        self.filtered = load_filtered(self.selected_filter_name.as_deref());
-        if self.stock_tab == StockTab::Filtered {
-            self.restore_selection_for_current_tab();
+    /// Puts bundle `name` in focus — the one a `Filtered` tab shows.
+    /// Remembered across launches.
+    fn focus_filter(&mut self, name: &str) {
+        if self.selected_filter_name.as_deref() != Some(name) {
+            self.selected_filter_name = Some(name.to_string());
+            save_selected_filter(name);
+        }
+    }
+
+    /// Matches of the bundle in focus (none if it has not been run).
+    fn focus_matches(&self) -> &[String] {
+        self.selected_filter_name
+            .as_ref()
+            .and_then(|name| self.filtered.get(name))
+            .map_or(&[], |matches| matches.as_slice())
+    }
+
+    /// Where the stock on screen is remembered: per tab, a filter bundle's
+    /// tab included, so every list keeps its own place.
+    fn selection_key(&self) -> String {
+        match (self.stock_tab, &self.selected_filter_name) {
+            (StockTab::Filtered, Some(name)) => filter_selection_key(name),
+            (tab, _) => tab.key().to_string(),
         }
     }
 
     fn select_stock(&mut self, idx: usize) {
         self.selected = Some(idx);
-        // Remember per-tab so future tab switches / restarts can restore it.
+        // Remember it so future tab switches / restarts can restore it.
         if let Some((info, _)) = self.stocks.get(idx) {
             self.last_selected_by_tab
-                .insert(self.stock_tab.key().to_string(), info.secid.clone());
+                .insert(self.selection_key(), info.secid.clone());
             save_last_selected(&self.last_selected_by_tab);
         }
         if let Some(period) = self.matched_period(idx) {
@@ -270,8 +347,8 @@ impl ChartApp {
         self.reload_candles();
     }
 
-    /// In the Filtered tab, the timeframe on which stock `idx` meets the
-    /// selected bundle, so the chart opens where the match can be seen: the
+    /// On a filter bundle's tab, the timeframe on which stock `idx` meets
+    /// that bundle, so the chart opens where the match can be seen: the
     /// timeframe holding the structure for `arc_*` / `pit_*` bundles (the
     /// current one if both do), otherwise the bundle's timeframe when it reads
     /// only one. `None` leaves the chart on the timeframe it is on.
@@ -289,9 +366,15 @@ impl ChartApp {
             Period::Daily => Period::Weekly,
             Period::Weekly => Period::Daily,
         };
+        // The list is what the last scan found; if the data has moved on and
+        // the stock no longer matches, go where the structure it was picked
+        // for can still be seen.
+        let still_matches =
+            evaluate_filters_on_stock(dir, &lines, &self.ma_windows, &bundle.periods);
         let has_shape = |period: Period| {
             let (candles, ma_lines) = load_candles(dir, period, &self.ma_windows);
-            !shapes_to_draw(&lines, &bundle.periods, period, &candles, &ma_lines).is_empty()
+            shapes_to_draw(&lines, &bundle.periods, period, &candles, &ma_lines, still_matches)
+                .has_structure()
         };
         if let Some(period) = [self.period, other].into_iter().find(|&p| has_shape(p)) {
             return Some(period);
@@ -317,7 +400,9 @@ impl ChartApp {
 
         let remembered = self
             .last_selected_by_tab
-            .get(self.stock_tab.key())
+            .get(&self.selection_key())
+            // Before bundles had a tab each, they shared one place.
+            .or_else(|| self.last_selected_by_tab.get(self.stock_tab.key()))
             .and_then(|secid| {
                 visible
                     .iter()
@@ -361,25 +446,20 @@ impl ChartApp {
         }
     }
 
-    /// Build the list of visible stock indices (matching current search + tab filters).
+    /// The stocks arrow keys walk through: those on the current tab that
+    /// pass the search.
     fn visible_stock_indices(&self) -> Vec<usize> {
         let search_lower = self.search.to_lowercase();
         self.stocks
             .iter()
             .enumerate()
             .filter(|(_, (info, _))| {
-                if !search_lower.is_empty()
-                    && !info.code.to_lowercase().contains(&search_lower)
-                    && !info.name.contains(&self.search)
-                    && !info.secid.to_lowercase().contains(&search_lower)
-                {
-                    return false;
-                }
-                match self.stock_tab {
-                    StockTab::Favorites => self.favorites.contains(&info.secid),
-                    StockTab::Filtered => self.filtered.contains(&info.secid),
-                    StockTab::All => true,
-                }
+                matches_search(info, &self.search, &search_lower)
+                    && match self.stock_tab {
+                        StockTab::Favorites => self.favorites.contains(&info.secid),
+                        StockTab::Filtered => self.focus_matches().contains(&info.secid),
+                        StockTab::All => true,
+                    }
             })
             .map(|(i, _)| i)
             .collect()
@@ -475,20 +555,11 @@ impl ChartApp {
         });
     }
 
-    fn run_sync(&mut self, ctx: &egui::Context) {
+    /// Runs stock-dl in the background: for `symbols` only (the favourites,
+    /// or one bundle's matches), or for every stock when `None`.
+    fn run_sync(&mut self, ctx: &egui::Context, symbols: Option<Vec<String>>) {
         let settings = load_settings();
         let ctx = ctx.clone();
-
-        // When on Favorites/Filtered tab, only sync those stocks
-        let symbols: Option<Vec<String>> = match self.stock_tab {
-            StockTab::Favorites if !self.favorites.is_empty() => {
-                Some(self.favorites.clone())
-            }
-            StockTab::Filtered if !self.filtered.is_empty() => {
-                Some(self.filtered.clone())
-            }
-            _ => None,
-        };
 
         self.sync_status = SyncStatus::Running {
             progress_pct: 0.0,
@@ -672,54 +743,52 @@ impl ChartApp {
         settings_data_dir(&load_settings())
     }
 
-    fn run_filter(&mut self, ctx: &egui::Context) {
-        let settings = load_settings();
-
-        // Resolve which named filter bundle to run. Falls back to the first
-        // entry if the persisted selection no longer exists.
-        let bundle = match self
-            .selected_filter_name
-            .as_ref()
-            .and_then(|n| settings.data_filters.iter().find(|f| &f.name == n))
-            .or_else(|| settings.data_filters.first())
-        {
-            Some(b) => b,
-            None => {
-                self.filter_status =
-                    FilterStatus::Error("未配置任何筛选 (settings.json: data_filters)".to_string());
-                return;
-            }
-        };
-
-        let filter_name = bundle.name.clone();
-        let filter_periods = bundle.periods.clone();
-
-        let filters: Vec<FilterLine> = match parse_filter_lines(&bundle.filters) {
-            Ok(f) => f,
-            Err(e) => {
-                self.filter_status = FilterStatus::Error(format!("过滤条件解析失败: {}", e));
-                return;
-            }
-        };
-        if filters.is_empty() {
-            self.filter_status = FilterStatus::Error("该筛选没有任何条件".to_string());
+    /// Scans every stock with bundle `name` in the background. Bundles are
+    /// scanned independently, so several can run at once; the matches come
+    /// back through the bundle's own channel (see `update`).
+    fn run_filter(&mut self, ctx: &egui::Context, name: &str) {
+        if self.filter_receivers.contains_key(name) {
             return;
         }
+        let settings = load_settings();
+        let parsed = settings
+            .data_filters
+            .iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| "找不到该筛选 (settings.json: data_filters)".to_string())
+            .and_then(|bundle| {
+                let lines = parse_filter_lines(&bundle.filters)
+                    .map_err(|e| format!("过滤条件解析失败: {}", e))?;
+                if lines.is_empty() {
+                    return Err("该筛选没有任何条件".to_string());
+                }
+                Ok((lines, bundle.periods.clone()))
+            });
+        let (filters, filter_periods) = match parsed {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                self.filter_status.insert(name.to_string(), FilterStatus::Error(e));
+                return;
+            }
+        };
 
         let ma_windows = settings.ma.clone();
         let data_dir = self.resolve_data_dir();
         let ctx = ctx.clone();
 
-        self.filter_status = FilterStatus::Running {
-            progress_pct: 0.0,
-            completed: 0,
-            total: 0,
-            matched: 0,
-            current_stock: String::new(),
-        };
+        self.filter_status.insert(
+            name.to_string(),
+            FilterStatus::Running {
+                progress_pct: 0.0,
+                completed: 0,
+                total: 0,
+                matched: 0,
+                current_stock: String::new(),
+            },
+        );
 
         let (tx, rx) = mpsc::channel();
-        self.filter_receiver = Some(rx);
+        self.filter_receivers.insert(name.to_string(), rx);
 
         std::thread::spawn(move || {
             let stocks = load_stock_list(&data_dir);
@@ -740,11 +809,10 @@ impl ChartApp {
                 ctx.request_repaint();
             }
 
+            // The UI thread stores them: scans of several bundles may finish
+            // together, and filtered.json is rewritten as a whole.
             matched_secids.sort();
-            save_filtered(Some(&filter_name), &matched_secids);
-
-            let matched = matched_secids.len();
-            let _ = tx.send(FilterMessage::Finished(Ok((matched, total))));
+            let _ = tx.send(FilterMessage::Finished(Ok((matched_secids, total))));
             ctx.request_repaint();
         });
     }
@@ -763,16 +831,194 @@ impl ChartApp {
             let settings = load_settings();
             let bundle = settings.data_filters.iter().find(|f| &f.name == name)?;
             let lines = parse_filter_lines(&bundle.filters).ok()?;
+            let (_, dir) = self.stocks.get(self.selected?)?;
+            // The stock is in the bundle's list, but that list is what the
+            // last scan found: a sync since may have moved it out of the
+            // conditions.
+            let still_matches =
+                evaluate_filters_on_stock(dir, &lines, &self.ma_windows, &bundle.periods);
             Some(shapes_to_draw(
                 &lines,
                 &bundle.periods,
                 self.period,
                 &self.candles,
                 &self.ma_lines,
+                still_matches,
             ))
         });
         self.overlay = shapes.unwrap_or_default();
         self.overlay_key = Some(key);
+    }
+
+    fn toggle_favorite(&mut self, secid: &str) {
+        if self.favorites.iter().any(|s| s == secid) {
+            self.favorites.retain(|s| s != secid);
+        } else {
+            self.favorites.push(secid.to_string());
+            self.favorites.sort();
+        }
+        save_favorites(&self.favorites);
+    }
+
+    /// The list of the current tab: every stock, the favourites, or the
+    /// matches of the bundle whose tab is open — those that pass the search.
+    fn show_stock_list(&mut self, ui: &mut egui::Ui, scroll_to_selected: bool) {
+        let clicked = {
+            let search_lower = self.search.to_lowercase();
+            let matches: HashSet<&str> = if self.stock_tab == StockTab::Filtered {
+                self.focus_matches().iter().map(String::as_str).collect()
+            } else {
+                HashSet::new()
+            };
+            let mut clicked = None;
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                for (i, (info, _)) in self.stocks.iter().enumerate() {
+                    if !matches_search(info, &self.search, &search_lower) {
+                        continue;
+                    }
+                    let is_fav = self.favorites.contains(&info.secid);
+                    let listed = match self.stock_tab {
+                        StockTab::All => true,
+                        StockTab::Favorites => is_fav,
+                        StockTab::Filtered => matches.contains(info.secid.as_str()),
+                    };
+                    if !listed {
+                        continue;
+                    }
+                    let selected = self.selected == Some(i);
+                    let scroll_to = selected && scroll_to_selected;
+                    if let Some(click) = stock_row(ui, info, is_fav, selected, scroll_to) {
+                        clicked = Some((i, click));
+                    }
+                }
+            });
+            clicked
+        };
+        match clicked {
+            Some((i, RowClick::Select)) => self.select_stock(i),
+            Some((i, RowClick::ToggleFavorite)) => {
+                let secid = self.stocks[i].0.secid.clone();
+                self.toggle_favorite(&secid);
+            }
+            None => {}
+        }
+    }
+
+    /// A filter bundle's tab: its own buttons and the timeframes it reads,
+    /// its own status line, and below them its own list of matches.
+    fn show_filter_tab(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        bundle: &NamedFilter,
+        is_syncing: bool,
+        scroll_to_selected: bool,
+    ) {
+        let dim = egui::Color32::from_gray(0x9E);
+        let blue = egui::Color32::from_rgb(0x90, 0xCA, 0xF9);
+        let small = |text: &str| egui::Button::new(egui::RichText::new(text).size(12.0));
+        let note = |text: String, color| egui::RichText::new(text).size(11.0).color(color);
+
+        let name = &bundle.name;
+        let matches = self.filtered.get(name);
+        let scanning = self.filter_receivers.contains_key(name);
+
+        let (mut run, mut sync, mut edit) = (false, false, false);
+        ui.horizontal(|ui| {
+            let text = if scanning {
+                "筛选中..."
+            } else if matches.is_some() {
+                "重新筛选"
+            } else {
+                "筛选"
+            };
+            run = ui.add_enabled(!scanning, small(text)).clicked();
+            if scanning {
+                ui.spinner();
+            }
+            let has_matches = matches.is_some_and(|m| !m.is_empty());
+            sync = ui
+                .add_enabled(has_matches && !is_syncing, small("同步"))
+                .on_hover_text("更新这个列表里股票的行情数据")
+                .clicked();
+            // Not during its scan: the matches would come back for
+            // conditions that have changed since.
+            edit = ui.add_enabled(!scanning, small("编辑")).clicked();
+
+            // Which timeframe(s) it reads, derived from the per-line
+            // `day:` / `week:` prefixes.
+            let periods = bundle.active_periods();
+            let period_label = match (
+                periods.contains(&Period::Daily),
+                periods.contains(&Period::Weekly),
+            ) {
+                (true, true) => "日+周",
+                (false, true) => "周",
+                _ => "日",
+            };
+            ui.label(note(format!("[{period_label}]"), blue));
+        });
+
+        match (self.filter_status.get(name), matches) {
+            (
+                Some(FilterStatus::Running {
+                    progress_pct,
+                    completed,
+                    total,
+                    matched,
+                    current_stock,
+                }),
+                _,
+            ) => {
+                ui.add(egui::ProgressBar::new(*progress_pct / 100.0).text(format!(
+                    "{completed}/{total} 匹配:{matched} ({progress_pct:.1}%)"
+                )));
+                if !current_stock.is_empty() {
+                    ui.label(note(current_stock.clone(), blue));
+                }
+            }
+            (Some(FilterStatus::Done { matched, total }), _) => {
+                ui.label(note(
+                    format!("筛选完成: {matched}/{total} 只股票符合条件"),
+                    egui::Color32::from_rgb(0x26, 0xa6, 0x9a),
+                ));
+            }
+            (Some(FilterStatus::Error(msg)), _) => {
+                ui.label(note(
+                    format!("筛选错误: {msg}"),
+                    egui::Color32::from_rgb(0xef, 0x53, 0x50),
+                ));
+            }
+            (Some(FilterStatus::Stale), _) => {
+                ui.label(note(
+                    "条件已修改，请重新筛选".to_string(),
+                    egui::Color32::from_rgb(0xFF, 0xB7, 0x4D),
+                ));
+            }
+            // Not run this session: what the last run left behind.
+            (None, Some(matches)) if matches.is_empty() => {
+                ui.label(note("没有符合条件的股票".to_string(), dim));
+            }
+            (None, Some(matches)) => {
+                ui.label(note(format!("{} 只股票符合条件", matches.len()), dim));
+            }
+            (None, None) => {
+                ui.label(note("尚未筛选".to_string(), dim));
+            }
+        }
+        ui.separator();
+
+        if run {
+            self.run_filter(ctx, name);
+        }
+        if sync {
+            let matches = self.filtered.get(name).cloned();
+            self.run_sync(ctx, matches);
+        }
+        if edit {
+            self.open_filter_editor(Some(name));
+        }
+        self.show_stock_list(ui, scroll_to_selected);
     }
 
     fn open_filter_editor(&mut self, name: Option<&str>) {
@@ -1005,21 +1251,46 @@ impl ChartApp {
         if let Some(orig) = &ed.original_name {
             if orig != &name {
                 rename_filtered(orig, &name);
+                self.rename_filter_state(orig, &name);
+            }
+            if conditions_changed {
+                // A scan still under way was started with the old conditions:
+                // dropping its channel discards what it will find.
+                self.filter_receivers.remove(&name);
+                self.filter_status.insert(name.clone(), FilterStatus::Stale);
             }
         }
         if conditions_changed {
             remove_filtered(&name);
+            self.filtered.remove(&name);
         }
 
-        self.selected_filter_name = Some(name.clone());
-        save_selected_filter(&name);
-        self.reload_filtered_for_selected_filter();
-        self.filter_status = if conditions_changed {
-            FilterStatus::Stale
-        } else {
-            FilterStatus::Idle
-        };
+        // The saved bundle's tab opens.
+        self.focus_filter(&name);
+        self.stock_tab = StockTab::Filtered;
+        self.restore_selection_for_current_tab();
         true
+    }
+
+    /// Carries what this session knows about a bundle over to its new name.
+    fn rename_filter_state(&mut self, old: &str, new: &str) {
+        if let Some(matches) = self.filtered.remove(old) {
+            self.filtered.insert(new.to_string(), matches);
+        }
+        if let Some(status) = self.filter_status.remove(old) {
+            self.filter_status.insert(new.to_string(), status);
+        }
+        if let Some(receiver) = self.filter_receivers.remove(old) {
+            self.filter_receivers.insert(new.to_string(), receiver);
+        }
+        if let Some(secid) = self.last_selected_by_tab.remove(&filter_selection_key(old)) {
+            self.last_selected_by_tab
+                .insert(filter_selection_key(new), secid);
+            save_last_selected(&self.last_selected_by_tab);
+        }
+        if self.selected_filter_name.as_deref() == Some(old) {
+            self.selected_filter_name = Some(new.to_string());
+        }
     }
 
     fn delete_filter_bundle(&mut self, name: &str) {
@@ -1028,12 +1299,31 @@ impl ChartApp {
         save_settings(&settings);
         remove_filtered(name);
 
-        self.selected_filter_name = settings.data_filters.first().map(|f| f.name.clone());
-        if let Some(n) = &self.selected_filter_name {
-            save_selected_filter(n);
+        self.filtered.remove(name);
+        self.filter_status.remove(name);
+        self.filter_receivers.remove(name);
+        if self
+            .last_selected_by_tab
+            .remove(&filter_selection_key(name))
+            .is_some()
+        {
+            save_last_selected(&self.last_selected_by_tab);
         }
-        self.reload_filtered_for_selected_filter();
-        self.filter_status = FilterStatus::Idle;
+
+        // If it was in focus, the first bundle left takes over; with none
+        // left, its tab gives way to 全部.
+        if self.selected_filter_name.as_deref() == Some(name) {
+            self.selected_filter_name = None;
+            if let Some(first) = settings.data_filters.first() {
+                self.focus_filter(&first.name);
+            }
+            if self.stock_tab == StockTab::Filtered {
+                if self.selected_filter_name.is_none() {
+                    self.stock_tab = StockTab::All;
+                }
+                self.restore_selection_for_current_tab();
+            }
+        }
     }
 
     fn refresh_stock_list(&mut self) {
@@ -1111,9 +1401,9 @@ impl eframe::App for ChartApp {
             self.refresh_stock_list();
         }
 
-        // Poll filter progress
-        let mut filter_done = false;
-        if let Some(ref rx) = self.filter_receiver {
+        // Poll filter scans: every bundle reports through its own channel.
+        let mut finished = Vec::new();
+        for (name, rx) in &self.filter_receivers {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     FilterMessage::Progress {
@@ -1122,38 +1412,45 @@ impl eframe::App for ChartApp {
                         matched,
                         stock_label,
                     } => {
-                        self.filter_status = FilterStatus::Running {
-                            progress_pct: if total > 0 {
-                                (completed as f32 / total as f32) * 100.0
-                            } else {
-                                0.0
-                            },
-                            completed,
-                            total,
-                            matched,
-                            current_stock: stock_label,
+                        let progress_pct = if total > 0 {
+                            (completed as f32 / total as f32) * 100.0
+                        } else {
+                            0.0
                         };
+                        self.filter_status.insert(
+                            name.clone(),
+                            FilterStatus::Running {
+                                progress_pct,
+                                completed,
+                                total,
+                                matched,
+                                current_stock: stock_label,
+                            },
+                        );
                     }
-                    FilterMessage::Finished(result) => {
-                        match result {
-                            Ok((matched, total)) => {
-                                self.filter_status =
-                                    FilterStatus::Done { matched, total };
-                                self.filtered = load_filtered(self.selected_filter_name.as_deref());
-                            }
-                            Err(e) => {
-                                self.filter_status = FilterStatus::Error(e);
-                            }
-                        }
-                        filter_done = true;
-                    }
+                    FilterMessage::Finished(result) => finished.push((name.clone(), result)),
                 }
             }
         }
-        if filter_done {
-            self.filter_receiver = None;
-            if self.stock_tab == StockTab::Filtered {
-                self.restore_selection_for_current_tab();
+        for (name, result) in finished {
+            self.filter_receivers.remove(&name);
+            match result {
+                Ok((matches, total)) => {
+                    let matched = matches.len();
+                    save_filtered(Some(&name), &matches);
+                    self.filtered.insert(name.clone(), matches);
+                    self.filter_status
+                        .insert(name.clone(), FilterStatus::Done { matched, total });
+                    // The list on screen changed under the selection.
+                    if self.stock_tab == StockTab::Filtered
+                        && self.selected_filter_name.as_deref() == Some(name.as_str())
+                    {
+                        self.restore_selection_for_current_tab();
+                    }
+                }
+                Err(e) => {
+                    self.filter_status.insert(name, FilterStatus::Error(e));
+                }
             }
         }
 
@@ -1212,29 +1509,87 @@ impl eframe::App for ChartApp {
 
         // ── Left panel: stock list ──
         egui::SidePanel::left("stock_panel")
-            .default_width(210.0)
+            .default_width(230.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
 
-                // Tab bar: 全部 | 自选 | 筛选
-                ui.horizontal(|ui| {
-                    for tab in [StockTab::All, StockTab::Favorites, StockTab::Filtered] {
+                // Tab bar: 全部 | 自选 | one tab per filter bundle | +
+                // Bundles are read from settings on every frame so edits to
+                // settings.json are reflected without a restart.
+                let settings = load_settings();
+                let mut open_tab = None;
+                let tab_text = |label: &str, active: bool| {
+                    let text = egui::RichText::new(label);
+                    if active {
+                        text.strong()
+                    } else {
+                        text.color(egui::Color32::from_rgb(0x78, 0x7b, 0x86))
+                    }
+                };
+                ui.horizontal_wrapped(|ui| {
+                    for tab in [StockTab::All, StockTab::Favorites] {
                         let active = self.stock_tab == tab;
-                        let text = if active {
-                            egui::RichText::new(tab.label()).strong()
-                        } else {
-                            egui::RichText::new(tab.label())
-                                .color(egui::Color32::from_rgb(0x78, 0x7b, 0x86))
-                        };
-                        if ui.selectable_label(active, text).clicked() && self.stock_tab != tab {
-                            self.stock_tab = tab;
-                            // Jump back to whichever stock the user was last
-                            // viewing on this tab (or the first visible one).
-                            self.restore_selection_for_current_tab();
+                        if ui.selectable_label(active, tab_text(tab.label(), active)).clicked()
+                            && !active
+                        {
+                            open_tab = Some((tab, None));
                         }
                     }
+                    ui.separator();
+                    for bundle in &settings.data_filters {
+                        let name = &bundle.name;
+                        let active = self.stock_tab == StockTab::Filtered
+                            && self.selected_filter_name.as_ref() == Some(name);
+                        // A scan under way shows on the tab itself; how
+                        // many stocks it matched is a hover away.
+                        let (label, hint) =
+                            match (self.filter_status.get(name), self.filtered.get(name)) {
+                                (Some(FilterStatus::Running { matched, .. }), _) => {
+                                    (format!("{name}…"), format!("筛选中，已匹配 {matched} 只"))
+                                }
+                                (_, Some(matches)) => {
+                                    (name.clone(), format!("{} 只股票符合条件", matches.len()))
+                                }
+                                (_, None) => (name.clone(), "尚未筛选".to_string()),
+                            };
+                        let tab = ui
+                            .selectable_label(active, tab_text(&label, active))
+                            .on_hover_text(hint);
+                        if tab.clicked() && !active {
+                            open_tab = Some((StockTab::Filtered, Some(name.clone())));
+                        }
+                    }
+                    if ui
+                        .selectable_label(false, tab_text("+", false))
+                        .on_hover_text("新建筛选")
+                        .clicked()
+                    {
+                        self.open_filter_editor(None);
+                    }
                 });
+                // The tab of a bundle that is gone (deleted, or removed from
+                // settings.json by hand) gives way to the first one left, or
+                // to 全部.
+                let open_bundle_exists = settings
+                    .data_filters
+                    .iter()
+                    .any(|b| Some(&b.name) == self.selected_filter_name.as_ref());
+                if open_tab.is_none() && self.stock_tab == StockTab::Filtered && !open_bundle_exists {
+                    open_tab = Some(match settings.data_filters.first() {
+                        Some(first) => (StockTab::Filtered, Some(first.name.clone())),
+                        None => (StockTab::All, None),
+                    });
+                }
+                if let Some((tab, bundle)) = open_tab {
+                    self.stock_tab = tab;
+                    if let Some(name) = bundle {
+                        self.focus_filter(&name);
+                    }
+                    // Jump back to whichever stock the user was last viewing
+                    // on this tab (or the first visible one).
+                    self.restore_selection_for_current_tab();
+                }
                 ui.separator();
 
                 ui.horizontal(|ui| {
@@ -1247,29 +1602,34 @@ impl eframe::App for ChartApp {
                 });
                 ui.separator();
 
-                // Sync button and progress
+                // Sync button and progress. A filter bundle's tab has its own
+                // button for its own matches, so only the progress shows there.
                 let is_syncing = matches!(self.sync_status, SyncStatus::Running { .. });
-                ui.horizontal(|ui| {
-                    let btn_text = if is_syncing {
-                        "同步中..."
-                    } else {
-                        match self.stock_tab {
-                            StockTab::Favorites => "同步自选",
-                            StockTab::Filtered => "同步筛选",
-                            StockTab::All => "同步数据",
+                if self.stock_tab != StockTab::Filtered {
+                    ui.horizontal(|ui| {
+                        let btn_text = if is_syncing {
+                            "同步中..."
+                        } else if self.stock_tab == StockTab::Favorites {
+                            "同步自选"
+                        } else {
+                            "同步数据"
+                        };
+                        let btn = ui.add_enabled(
+                            !is_syncing,
+                            egui::Button::new(egui::RichText::new(btn_text).size(12.0)),
+                        );
+                        if btn.clicked() {
+                            // On the 自选 tab only those stocks are synced.
+                            let favorites = (self.stock_tab == StockTab::Favorites
+                                && !self.favorites.is_empty())
+                            .then(|| self.favorites.clone());
+                            self.run_sync(ctx, favorites);
                         }
-                    };
-                    let btn = ui.add_enabled(
-                        !is_syncing,
-                        egui::Button::new(egui::RichText::new(btn_text).size(12.0)),
-                    );
-                    if btn.clicked() {
-                        self.run_sync(ctx);
-                    }
-                    if is_syncing {
-                        ui.spinner();
-                    }
-                });
+                        if is_syncing {
+                            ui.spinner();
+                        }
+                    });
+                }
                 match &self.sync_status {
                     SyncStatus::Running {
                         progress_pct,
@@ -1313,182 +1673,9 @@ impl eframe::App for ChartApp {
                     }
                     SyncStatus::Idle => {}
                 }
-                ui.separator();
-
-                // Filter button and progress (only on Filtered tab)
-                if self.stock_tab == StockTab::Filtered {
-                    let is_filtering =
-                        matches!(self.filter_status, FilterStatus::Running { .. });
-
-                    // Filter-bundle picker. Reads names from settings on every
-                    // frame so edits to settings.json are reflected without a
-                    // restart.
-                    let settings = load_settings();
-                    let available_filters: Vec<String> =
-                        settings.data_filters.iter().map(|f| f.name.clone()).collect();
-                    if available_filters.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("尚未配置筛选")
-                                    .size(11.0)
-                                    .color(egui::Color32::from_gray(0x9E)),
-                            );
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("新建").size(12.0)))
-                                .clicked()
-                            {
-                                self.open_filter_editor(None);
-                            }
-                        });
-                    } else {
-                        // Repair stale selection (e.g. user removed the active
-                        // bundle from settings).
-                        if !self
-                            .selected_filter_name
-                            .as_ref()
-                            .map(|n| available_filters.contains(n))
-                            .unwrap_or(false)
-                        {
-                            self.selected_filter_name = Some(available_filters[0].clone());
-                            if let Some(name) = &self.selected_filter_name {
-                                save_selected_filter(name);
-                            }
-                        }
-                        let prev_filter = self.selected_filter_name.clone();
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("筛选:").size(12.0));
-                            let current = self
-                                .selected_filter_name
-                                .clone()
-                                .unwrap_or_else(|| available_filters[0].clone());
-                            ui.add_enabled_ui(!is_filtering, |ui| {
-                                egui::ComboBox::from_id_salt("filter-bundle-select")
-                                    .width(110.0)
-                                    .selected_text(egui::RichText::new(&current).size(12.0))
-                                    .show_ui(ui, |ui| {
-                                        for name in &available_filters {
-                                            ui.selectable_value(
-                                                &mut self.selected_filter_name,
-                                                Some(name.clone()),
-                                                name.as_str(),
-                                            );
-                                        }
-                                    });
-                            });
-                            // Show which timeframe(s) the active filter reads,
-                            // derived from the per-line `day:` / `week:` prefixes.
-                            let period_label = settings
-                                .data_filters
-                                .iter()
-                                .find(|f| Some(&f.name) == self.selected_filter_name.as_ref())
-                                .map(|f| {
-                                    let periods = f.active_periods();
-                                    let has_daily = periods.contains(&Period::Daily);
-                                    let has_weekly = periods.contains(&Period::Weekly);
-                                    match (has_daily, has_weekly) {
-                                        (true, true) => "日+周",
-                                        (false, true) => "周",
-                                        _ => "日",
-                                    }
-                                })
-                                .unwrap_or("日");
-                            ui.label(
-                                egui::RichText::new(format!("[{period_label}]"))
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(0x90, 0xCA, 0xF9)),
-                            );
-                        });
-                        if self.selected_filter_name != prev_filter {
-                            if let Some(name) = &self.selected_filter_name {
-                                save_selected_filter(name);
-                            }
-                            self.reload_filtered_for_selected_filter();
-                        }
-                    }
-
-                    ui.horizontal(|ui| {
-                        let btn_text = if is_filtering {
-                            "筛选中..."
-                        } else {
-                            "重新筛选"
-                        };
-                        let btn = ui.add_enabled(
-                            !is_filtering,
-                            egui::Button::new(
-                                egui::RichText::new(btn_text).size(12.0),
-                            ),
-                        );
-                        if btn.clicked() {
-                            self.run_filter(ctx);
-                        }
-                        if is_filtering {
-                            ui.spinner();
-                        }
-                        if !available_filters.is_empty() {
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("编辑").size(12.0)))
-                                .clicked()
-                            {
-                                let name = self.selected_filter_name.clone();
-                                self.open_filter_editor(name.as_deref());
-                            }
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("新建").size(12.0)))
-                                .clicked()
-                            {
-                                self.open_filter_editor(None);
-                            }
-                        }
-                    });
-                    match &self.filter_status {
-                        FilterStatus::Running {
-                            progress_pct,
-                            completed,
-                            total,
-                            matched,
-                            current_stock,
-                        } => {
-                            let bar_pct = *progress_pct / 100.0;
-                            ui.add(
-                                egui::ProgressBar::new(bar_pct).text(format!(
-                                    "{completed}/{total} 匹配:{matched} ({progress_pct:.1}%)"
-                                )),
-                            );
-                            if !current_stock.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(current_stock)
-                                        .size(11.0)
-                                        .color(egui::Color32::from_rgb(
-                                            0x90, 0xCA, 0xF9,
-                                        )),
-                                );
-                            }
-                        }
-                        FilterStatus::Done { matched, total } => {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "筛选完成: {matched}/{total} 只股票符合条件"
-                                ))
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(0x26, 0xa6, 0x9a)),
-                            );
-                        }
-                        FilterStatus::Error(msg) => {
-                            ui.label(
-                                egui::RichText::new(format!("筛选错误: {msg}"))
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(0xef, 0x53, 0x50)),
-                            );
-                        }
-                        FilterStatus::Stale => {
-                            ui.label(
-                                egui::RichText::new("条件已修改，请点击\"重新筛选\"")
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(0xFF, 0xB7, 0x4D)),
-                            );
-                        }
-                        FilterStatus::Idle => {}
-                    }
+                if self.stock_tab != StockTab::Filtered
+                    || !matches!(self.sync_status, SyncStatus::Idle)
+                {
                     ui.separator();
                 }
 
@@ -1496,82 +1683,17 @@ impl eframe::App for ChartApp {
                 // knows whether it should call `scroll_to_me` on itself.
                 let scroll_to_selected = std::mem::take(&mut self.scroll_to_selected);
 
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    let search_lower = self.search.to_lowercase();
-                    let mut click_idx = None;
-                    let mut fav_toggle = None;
-
-                    for (i, (info, _)) in self.stocks.iter().enumerate() {
-                        // Search filter
-                        if !search_lower.is_empty()
-                            && !info.code.to_lowercase().contains(&search_lower)
-                            && !info.name.contains(&self.search)
-                            && !info.secid.to_lowercase().contains(&search_lower)
-                        {
-                            continue;
-                        }
-
-                        // Tab filter
-                        let is_fav = self.favorites.contains(&info.secid);
-                        match self.stock_tab {
-                            StockTab::Favorites => {
-                                if !is_fav {
-                                    continue;
-                                }
-                            }
-                            StockTab::Filtered => {
-                                if !self.filtered.contains(&info.secid) {
-                                    continue;
-                                }
-                            }
-                            StockTab::All => {}
-                        }
-
-                        let selected = self.selected == Some(i);
-                        let star = if is_fav { "★" } else { "☆" };
-                        let star_color = if is_fav {
-                            egui::Color32::from_rgb(0xFF, 0xD7, 0x00)
-                        } else {
-                            egui::Color32::from_rgb(0x55, 0x55, 0x55)
-                        };
-
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(star).color(star_color).size(14.0),
-                                    )
-                                    .frame(false),
-                                )
-                                .clicked()
-                            {
-                                fav_toggle = Some((info.secid.clone(), is_fav));
-                            }
-                            let label = format!("{} {}", info.secid, info.name);
-                            let resp = ui.selectable_label(selected, &label);
-                            if resp.clicked() {
-                                click_idx = Some(i);
-                            }
-                            if selected && scroll_to_selected {
-                                resp.scroll_to_me(Some(egui::Align::Center));
-                            }
-                        });
+                let open_bundle = settings
+                    .data_filters
+                    .iter()
+                    .filter(|_| self.stock_tab == StockTab::Filtered)
+                    .find(|b| Some(&b.name) == self.selected_filter_name.as_ref());
+                match open_bundle {
+                    Some(bundle) => {
+                        self.show_filter_tab(ctx, ui, bundle, is_syncing, scroll_to_selected);
                     }
-
-                    if let Some(i) = click_idx {
-                        self.select_stock(i);
-                    }
-
-                    if let Some((secid, was_fav)) = fav_toggle {
-                        if was_fav {
-                            self.favorites.retain(|s| s != &secid);
-                        } else {
-                            self.favorites.push(secid);
-                            self.favorites.sort();
-                        }
-                        save_favorites(&self.favorites);
-                    }
-                });
+                    None => self.show_stock_list(ui, scroll_to_selected),
+                }
             });
 
         self.show_filter_editor(ctx);
@@ -1611,7 +1733,7 @@ impl eframe::App for ChartApp {
                 }
 
                 // Switch for the structure markers, offered when the stock
-                // on screen has one to show.
+                // on screen has something to show.
                 if !self.overlay.is_empty() {
                     ui.separator();
                     ui.toggle_value(&mut self.show_overlay, "走势标识")

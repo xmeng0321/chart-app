@@ -19,6 +19,8 @@ const ARC_RALLY_COLOR: Color32 = Color32::from_rgb(0xec, 0xef, 0xf1);
 const PIT_TURN_COLOR: Color32 = ARC_COLOR;
 const PIT_BOX_COLOR: Color32 = ARC_CENTRE_COLOR;
 const PIT_LOW_COLOR: Color32 = ARC_RALLY_COLOR;
+// Note under the summaries when the stock has since left the filter.
+const STALE_COLOR: Color32 = Color32::from_rgb(0xff, 0xb7, 0x4d);
 
 const PRICE_AXIS_WIDTH: f32 = 85.0;
 const TIME_AXIS_HEIGHT: f32 = 28.0;
@@ -107,7 +109,8 @@ pub fn ma_color(period: usize) -> Color32 {
 ///
 /// `shapes` are the structures found in `candles` (see `data::ArcStructure`,
 /// `data::PitStructure`) to mark on the chart, so a stock picked by an `arc_*`
-/// or `pit_*` filter shows why.
+/// or `pit_*` filter shows why — and a note when it no longer meets that
+/// filter on these candles.
 pub fn draw_chart(
     ui: &mut Ui,
     candles: &[Candle],
@@ -193,6 +196,16 @@ pub fn draw_chart(
     }
     if let Some(pit) = &shapes.pit {
         draw_pit(&clipped, candles, pit, state, &chart_rect, summary_y);
+        summary_y += 18.0;
+    }
+    if shapes.stale {
+        clipped.text(
+            pos2(chart_rect.max.x - 10.0, summary_y),
+            Align2::RIGHT_TOP,
+            "按最新行情已不满足该筛选的条件 (列表是上次筛选的结果)",
+            FontId::proportional(12.0),
+            STALE_COLOR,
+        );
     }
 
     // Current price line

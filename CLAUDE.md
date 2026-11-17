@@ -46,18 +46,39 @@ stock dir/daily.csv → load_candles → (Vec<Candle>, Vec<MaLine>)
 | `settings.json` | `AppSettings`: data dir, binary paths, MA windows, named filter bundles |
 | `favorites.json` | `Vec<String>` of secids |
 | `filtered.json` | `HashMap<filter_name, Vec<String>>` of matched secids per filter |
-| `last_selected.json` | `HashMap<tab_key, secid>` |
-| `selected_filter.json` | Last-chosen filter name |
+| `last_selected.json` | `HashMap<key, secid>`: `all`, `favorites`, and one `filtered:<bundle>` per filter bundle |
+| `selected_filter.json` | Name of the filter bundle in focus |
 
 ### External binaries
 
 - **`stock-dl`** — downloads/updates stock CSV data. Called as `stock-dl -o <dir> download [-c N] [--codes ...]`.
 - **`trade-agent`** — AI analysis of a selected range. Called as `trade-agent <csv> --date-range START:END [--model M] [--csv_as_chart true]`. Returns JSON `{match, confidence, explanation}`.
 
+### Filter tabs
+
+The left panel's tab bar is 全部 | 自选 | one tab per filter bundle | + (new
+bundle). A bundle's tab (`ChartApp::show_filter_tab`) holds its own buttons —
+筛选 / 重新筛选, 同步 (stock-dl for just its matches), 编辑 — its own status
+line, and its own list of matches. `StockTab::Filtered` is the kind of all those
+tabs; which one is open is `selected_filter_name`, the bundle in focus.
+
+- State is per bundle, keyed by name: `filtered` (the cached matches, mirroring
+  `filtered.json`; no entry = not run since its conditions last changed),
+  `filter_status`, and `filter_receivers` while a scan runs. Scans are
+  independent, so several bundles can run at once (a running one shows `…` on
+  its tab); a worker sends its matches back and the UI thread writes
+  `filtered.json`.
+- On a bundle's tab, arrow keys walk its list and the chart marks the
+  structures that bundle matched. Every tab remembers its own last-viewed stock.
+- Renaming, editing or deleting a bundle carries its state along
+  (`rename_filter_state`, `delete_filter_bundle`); changing its conditions drops
+  its matches and any scan still running for the old ones. Saving a bundle
+  opens its tab.
+
 ### Filter expressions
 
 Filters live in `settings.json` under `data_filters` as `NamedFilter` objects, and
-are created/edited in the app (筛选 tab → 编辑/新建, `FilterEditor` in `main.rs`):
+are created/edited in the app (the + tab, or 编辑 on a bundle's tab; `FilterEditor` in `main.rs`):
 
 ```json
 {
@@ -111,11 +132,13 @@ cheap lines.
 the editor's 新建 dialog and runnable by name with `--filter`. They are ordinary
 filter lines, so their thresholds are tuned in the editor. A preset also carries its
 `periods`: 下破变脸 is one unprefixed `pit_*` line scanned on both timeframes (see
-"Pit structures" below). It finds a shape and promises nothing: a rough check of
-its daily picks (every 5th session, 2019–2026, 28.7k picks, a median of 43 a day)
-showed no higher rate of +20%-in-20-bars moves than the market (13.7% vs 14.1%)
-and at most a small edge in 20-bar return (+0.7 points pooled, +0.3 averaged by
-date with t ≈ 1.6; 53% beat the day's median stock; positive in 7 of 8 years).
+"Pit structures" below), plus `day: close > ma100`. It finds a shape and promises
+nothing: a rough check of its daily picks (every 5th session, 2019–2026, 14.9k
+picks, a median of 22 a day) showed about the market's rate of +20%-in-20-bars
+moves (14.6% vs 13.7%) and no dependable edge in 20-bar return (+0.8 points
+pooled, but +0.04 averaged by date, t ≈ 0.2; 53% beat the day's median stock).
+The MA line halves the picks (the shape alone: 28.7k, 43 a day) without changing
+that picture.
 
 蓄势待发 and 放量突破 are lines over the window columns.
 They come from a study of what every A-share looked like before a burst (+30%
@@ -189,13 +212,22 @@ no `[N]` offset.
 arc_len >= 40 and arc_peak <= 100 and arc_break >= -10
 ```
 
-In the Filtered tab the chart marks the structure that got the stock picked
+On a filter bundle's tab the chart marks the structure that got the stock picked
 (`chart.rs:draw_arc`): the rally in white from 起涨 to its top, the centre line
 in blue, the arc under the lows in yellow, and a one-line summary top-right;
 the 走势标识 toolbar button hides it. `ChartApp::refresh_overlay` picks it with
 `shapes_to_draw` (`arc_to_draw` + `pit_to_draw`) for the timeframe on screen,
 and selecting a stock there switches the chart to the timeframe on which it
 qualifies (`ChartApp::matched_period`).
+
+A bundle's list is what its last scan found, while the marks are judged on the
+candles as they are now — and selecting a stock auto-syncs it. So a listed stock
+may no longer meet its bundle (e.g. today's bar took it past `pit_pos <= 100`).
+`refresh_overlay` checks that with `evaluate_filters_on_stock`; when the stock
+has left the bundle, `shapes_to_draw` falls back to the structure it was most
+likely picked for (`allow_unmet`: the one meeting the most lines, else the
+longest), `MatchedShapes::stale` is set, and the chart adds an orange note under
+the summary. With no structure left at all the note stands alone.
 
 To scan both timeframes, leave the line unprefixed and set the bundle's
 `periods` to `["daily", "weekly"]` (the editor keeps `periods` but cannot edit
@@ -260,10 +292,13 @@ families; each is bound on its own.
 
 ```
 pit_box >= 30 and pit_amp <= 40 and pit_len <= 40 and pit_pos <= 100
+day: close > ma100
 ```
 
-That line is the 下破变脸 preset: a box of at least 30 bars no taller than
-40%, the pit low within the last 40 bars, the close still inside the box.
+Those two lines are the 下破变脸 preset: a box of at least 30 bars no taller
+than 40%, the pit low within the last 40 bars, the close still inside the box —
+and above its 100-day average (an ordinary filter line: change the `ma100`, or
+delete it).
 
 On the chart (`chart.rs:draw_pit`) the box is a blue rectangle with its floor
 carried on as a dashed line, the pit low is marked 坑底, the turn line is
