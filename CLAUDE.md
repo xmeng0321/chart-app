@@ -52,6 +52,9 @@ stock dir/daily.csv → load_candles → (Vec<Candle>, Vec<MaLine>)
 ### External binaries
 
 - **`stock-dl`** — downloads/updates stock CSV data. Called as `stock-dl -o <dir> download [-c N] [--codes ...]`.
+  It draws its progress bar (`Downloading [===>  ] 234/5015  skip:12  sh600519 贵州茅台`) on
+  stderr only when that is a terminal, so `run_sync` hands it a pseudo-terminal (`stderr_pty`)
+  and reads the bar back (`read_dl_stderr` → `parse_dl_bar_line`); stdout carries the summary.
 - **`trade-agent`** — AI analysis of a selected range. Called as `trade-agent <csv> --date-range START:END [--model M] [--csv_as_chart true]`. Returns JSON `{match, confidence, explanation}`.
 
 ### Filter tabs

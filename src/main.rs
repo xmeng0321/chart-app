@@ -597,11 +597,26 @@ impl ChartApp {
             }
 
             cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
+            // stock-dl draws its progress bar on stderr, and only when that is
+            // a terminal: give it a pseudo-terminal and read the bar back.
+            let pty_ours = match stderr_pty() {
+                Some((ours, theirs)) => {
+                    cmd.stderr(theirs);
+                    Some(ours)
+                }
+                None => {
+                    cmd.stderr(std::process::Stdio::piped());
+                    None
+                }
+            };
 
             eprintln!("[stock-dl] Running: {:?}", cmd);
 
-            let mut child = match cmd.spawn() {
+            let spawned = cmd.spawn();
+            // `cmd` holds our copy of the terminal's child end: close it, or
+            // reading our end would never see stock-dl exit.
+            drop(cmd);
+            let mut child = match spawned {
                 Ok(child) => child,
                 Err(e) => {
                     let _ = tx.send(SyncMessage::Finished(Err(format!(
@@ -613,7 +628,17 @@ impl ChartApp {
                 }
             };
 
-            // Read stdout line-by-line for progress
+            let stderr: Box<dyn std::io::Read + Send> = match (pty_ours, child.stderr.take()) {
+                (Some(ours), _) => Box::new(ours),
+                (None, Some(pipe)) => Box::new(pipe),
+                (None, None) => Box::new(std::io::empty()),
+            };
+            let stderr_reader = {
+                let (tx, ctx) = (tx.clone(), ctx.clone());
+                std::thread::spawn(move || read_dl_stderr(stderr, &tx, &ctx))
+            };
+
+            // stdout: the summary, and progress lines from older stock-dl.
             let stdout = child.stdout.take().unwrap();
             let reader = std::io::BufReader::new(stdout);
             // New stock-dl format: separate updated / skipped / failed fields.
@@ -652,11 +677,7 @@ impl ChartApp {
             }
 
             let status = child.wait();
-            let stderr_output = child
-                .stderr
-                .take()
-                .map(|stderr| std::io::read_to_string(stderr).unwrap_or_default())
-                .unwrap_or_default();
+            let stderr_output = stderr_reader.join().unwrap_or_default();
 
             // Skipped = already up-to-date, which is a successful outcome.
             let success = last_updated + last_skipped;
@@ -1638,10 +1659,13 @@ impl eframe::App for ChartApp {
                         current_stock,
                     } => {
                         let bar_pct = *progress_pct / 100.0;
-                        ui.add(
-                            egui::ProgressBar::new(bar_pct)
-                                .text(format!("{completed}/{total} ({progress_pct:.1}%)")),
-                        );
+                        // stock-dl may first spend a while building its stock list.
+                        let text = if *total == 0 {
+                            "准备中…".to_string()
+                        } else {
+                            format!("{completed}/{total} ({progress_pct:.1}%)")
+                        };
+                        ui.add(egui::ProgressBar::new(bar_pct).text(text));
                         if !current_stock.is_empty() {
                             ui.label(
                                 egui::RichText::new(current_stock)
@@ -1852,6 +1876,105 @@ fn strip_secid_prefix(secid: &str) -> &str {
         }
     }
     secid
+}
+
+/// A pseudo-terminal to use as a child's stderr: our end to read, and the
+/// child's end for `Command::stderr`. stock-dl draws its progress bar only
+/// when stderr is a terminal; into a pipe it prints nothing until it is done.
+#[cfg(unix)]
+fn stderr_pty() -> Option<(std::fs::File, std::process::Stdio)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (mut ours, mut theirs) = (-1, -1);
+    // Wide, so the bar's stock name is not cut off.
+    let mut size = libc::winsize {
+        ws_row: 24,
+        ws_col: 200,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let opened = unsafe {
+        libc::openpty(
+            &mut ours,
+            &mut theirs,
+            std::ptr::null_mut(),
+            std::ptr::null_mut::<libc::termios>(),
+            &mut size,
+        )
+    } == 0;
+    if !opened {
+        return None;
+    }
+    // Keep both ends out of any other process the app starts meanwhile: a
+    // stray copy of the child's end would keep ours from ever seeing the end.
+    unsafe {
+        libc::fcntl(ours, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(theirs, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    let ours = unsafe { std::fs::File::from_raw_fd(ours) };
+    let theirs = unsafe { OwnedFd::from_raw_fd(theirs) };
+    Some((ours, theirs.into()))
+}
+
+#[cfg(not(unix))]
+fn stderr_pty() -> Option<(std::fs::File, std::process::Stdio)> {
+    None
+}
+
+/// Reads stock-dl's stderr until it closes. Each redraw of its progress bar
+/// becomes a `SyncMessage::Progress`; everything else is returned, as the
+/// error message should stock-dl fail.
+fn read_dl_stderr(
+    mut stderr: impl std::io::Read,
+    tx: &mpsc::Sender<SyncMessage>,
+    ctx: &egui::Context,
+) -> String {
+    let mut other = Vec::new();
+    let mut shown: Option<(usize, String)> = None;
+    let mut handle = |segment: &[u8]| {
+        let text = strip_ansi(&String::from_utf8_lossy(segment));
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let Some((pct, completed, total, stock_label)) = parse_dl_bar_line(text) else {
+            other.push(text.to_string());
+            return;
+        };
+        // The bar is redrawn on a timer too; only pass on what changed.
+        if shown.as_ref() != Some(&(completed, stock_label.clone())) {
+            shown = Some((completed, stock_label.clone()));
+            let _ = tx.send(SyncMessage::Progress {
+                pct,
+                completed,
+                total,
+                stock_label,
+            });
+            ctx.request_repaint();
+        }
+    };
+
+    // Bar redraws end in `\r`, ordinary lines in `\n` (`\r\n` on a terminal).
+    // Split the bytes, not text: a read may end inside a character.
+    let mut pending = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match stderr.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A pseudo-terminal reports EIO once the child's end is closed.
+            Err(_) => 0,
+        };
+        if n == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        while let Some(i) = pending.iter().position(|&b| b == b'\r' || b == b'\n') {
+            let segment: Vec<u8> = pending.drain(..=i).collect();
+            handle(&segment[..i]);
+        }
+    }
+    handle(&pending);
+    other.join("\n")
 }
 
 fn setup_fonts(ctx: &egui::Context) {

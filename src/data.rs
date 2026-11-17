@@ -554,6 +554,50 @@ pub fn parse_progress_line(line: &str) -> Option<(f32, usize, usize, String)> {
     Some((pct, completed, total, stock_label))
 }
 
+/// Parse one redraw of stock-dl's progress bar (Tencent version), as it
+/// appears on a terminal once escape codes are stripped:
+/// `Downloading [=====>     ] 234/5015  skip:12  sh600519 贵州茅台`.
+/// `skip:` is empty until the first stock is done. stock-dl only draws the bar
+/// when its stderr is a terminal, so `run_sync` hands it a pseudo-terminal.
+pub fn parse_dl_bar_line(line: &str) -> Option<(f32, usize, usize, String)> {
+    let rest = line.trim().strip_prefix("Downloading [")?;
+    let rest = &rest[rest.find(']')? + 1..];
+    let mut words = rest.split_whitespace().peekable();
+    let (completed, total) = words.next()?.split_once('/')?;
+    let completed: usize = completed.parse().ok()?;
+    let total: usize = total.parse().ok()?;
+    words.next_if(|w| w.starts_with("skip:"));
+    let stock_label = words.collect::<Vec<_>>().join(" ");
+    let pct = if total > 0 {
+        completed as f32 / total as f32 * 100.0
+    } else {
+        0.0
+    };
+    Some((pct, completed, total, stock_label))
+}
+
+/// Drop terminal escape sequences (colours, cursor moves, line clears).
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // CSI: ESC [ params… final byte in '@'..='~'; anything else after ESC
+        // is a two-character sequence.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Parse stock-dl final line: `finished: success=N, failed=M`
 pub fn parse_finished_line(line: &str) -> Option<(usize, usize)> {
     let line = line.trim();
@@ -2912,6 +2956,30 @@ mod tests {
         );
         // "Download complete." header line must not match
         assert_eq!(parse_dl_summary_field("Download complete."), None);
+    }
+
+    #[test]
+    fn parses_dl_progress_bar() {
+        // As captured from stock-dl on a pseudo-terminal: a coloured bar,
+        // redrawn after `\r` + clear-line.
+        let raw = "\x1b[2KDownloading [\x1b[36m==========>\x1b[0m\x1b[34m                   \x1b[0m] 1/3  skip:0  sz000001 平安银行     ";
+        let line = strip_ansi(raw);
+        assert!(!line.contains('\x1b'));
+        let (pct, completed, total, label) = parse_dl_bar_line(&line).unwrap();
+        assert_eq!((completed, total), (1, 3));
+        assert!((pct - 100.0 / 3.0).abs() < 1e-3);
+        assert_eq!(label, "sz000001 平安银行");
+
+        // Before the first stock finishes `skip:` is empty.
+        let (pct, completed, total, label) =
+            parse_dl_bar_line("Downloading [                              ] 0/5015  skip:  sh600519 贵州茅台")
+                .unwrap();
+        assert_eq!((pct, completed, total), (0.0, 0, 5015));
+        assert_eq!(label, "sh600519 贵州茅台");
+
+        // stdout's header and summary are not the bar.
+        assert!(parse_dl_bar_line("Downloading 3 stocks into /tmp/x (concurrency=2, fq=qfq)").is_none());
+        assert!(parse_dl_bar_line("  updated  : 3 (with 6429 new bars)").is_none());
     }
 
     #[test]
