@@ -48,6 +48,7 @@ stock dir/daily.csv → load_candles → (Vec<Candle>, Vec<MaLine>)
 | `filtered.json` | `HashMap<filter_name, Vec<String>>` of matched secids per filter |
 | `last_selected.json` | `HashMap<key, secid>`: `all`, `favorites`, and one `filtered:<bundle>` per filter bundle |
 | `selected_filter.json` | Name of the filter bundle in focus |
+| `also_filters.json` | `HashMap<bundle, Vec<bundle>>`: each bundle tab's 同时满足 choice |
 
 ### External binaries
 
@@ -73,6 +74,15 @@ tabs; which one is open is `selected_filter_name`, the bundle in focus.
   `filtered.json`.
 - On a bundle's tab, arrow keys walk its list and the chart marks the
   structures that bundle matched. Every tab remembers its own last-viewed stock.
+- 同时满足: a bundle's tab can tick any number of other bundles (a checkbox
+  menu under its buttons; `also_filters`). Its list is then the stocks all of
+  them matched — `matched_by_all` over their cached lists, no rescan; empty
+  while one of them has not been run. 筛选 / 重新筛选 there runs every bundle
+  involved, 同步 syncs the intersection, 编辑 still edits the tab's own bundle.
+  The chart marks each kind of structure from the first bundle that has one
+  (`MatchedShapes::merge`), and the stale note names the bundles a stock has
+  dropped out of. Renaming or deleting a bundle carries through the choices
+  (`rename_in_also`, `prune_also`).
 - Renaming, editing or deleting a bundle carries its state along
   (`rename_filter_state`, `delete_filter_bundle`); changing its conditions drops
   its matches and any scan still running for the old ones. Saving a bundle

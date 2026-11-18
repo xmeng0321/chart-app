@@ -179,6 +179,86 @@ pub fn save_selected_filter(name: &str) {
     }
 }
 
+// ── 同时满足 persistence ──
+//
+// A filter bundle's tab can narrow its list to the stocks that also meet
+// other bundles (同时满足). Keyed by the tab's bundle; values are the other
+// bundles' names, in tab order.
+
+pub fn also_filters_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".config")
+        .join("chart-app")
+        .join("also_filters.json")
+}
+
+pub fn load_also_filters() -> HashMap<String, Vec<String>> {
+    std::fs::read_to_string(also_filters_path())
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_also_filters(also: &HashMap<String, Vec<String>>) {
+    let path = also_filters_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(also) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Carries a bundle's rename through the 同时满足 choices: its own, and its
+/// place in other tabs' choices.
+pub fn rename_in_also(also: &mut HashMap<String, Vec<String>>, old: &str, new: &str) {
+    if let Some(others) = also.remove(old) {
+        also.insert(new.to_string(), others);
+    }
+    for others in also.values_mut() {
+        for name in others.iter_mut().filter(|n| *n == old) {
+            *name = new.to_string();
+        }
+    }
+}
+
+/// Drops the 同时满足 choices that name a bundle `exists` says is gone, and
+/// the gone bundles' own. Whether anything changed.
+pub fn prune_also(also: &mut HashMap<String, Vec<String>>, exists: impl Fn(&str) -> bool) -> bool {
+    let gone = |name: &String| !exists(name);
+    let outdated = also
+        .iter()
+        .any(|(name, others)| gone(name) || others.is_empty() || others.iter().any(gone));
+    if !outdated {
+        return false;
+    }
+    also.retain(|name, _| exists(name));
+    for others in also.values_mut() {
+        others.retain(|n| exists(n));
+    }
+    also.retain(|_, others| !others.is_empty());
+    true
+}
+
+/// The stocks every bundle in `names` matched, by their cached lists (what
+/// `filtered.json` holds). `None` while any of them has no list — not run
+/// since its conditions last changed — or when `names` is empty.
+pub fn matched_by_all<'a>(
+    filtered: &'a HashMap<String, Vec<String>>,
+    names: &[String],
+) -> Option<std::collections::HashSet<&'a str>> {
+    let (first, rest) = names.split_first()?;
+    let mut both: std::collections::HashSet<&str> =
+        filtered.get(first)?.iter().map(String::as_str).collect();
+    for name in rest {
+        let other: std::collections::HashSet<&str> =
+            filtered.get(name)?.iter().map(String::as_str).collect();
+        both.retain(|secid| other.contains(secid));
+    }
+    Some(both)
+}
+
 // ── App settings (stock-dl config) ──
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -2176,6 +2256,9 @@ pub struct MatchedShapes {
     /// The structures are then the ones it was most likely picked for, and
     /// the chart says so.
     pub stale: bool,
+    /// Which bundles the stock no longer meets, when the caller knows (a
+    /// list can be several bundles' — 同时满足), so the chart can name them.
+    pub unmet: Vec<String>,
 }
 
 impl MatchedShapes {
@@ -2187,6 +2270,18 @@ impl MatchedShapes {
     /// Nothing to show at all: no structure, and no reason to explain why.
     pub fn is_empty(&self) -> bool {
         !self.has_structure() && !self.stale
+    }
+
+    /// What to mark for a stock listed by several bundles (同时满足): each
+    /// kind of structure from the first bundle that has one, and stale if
+    /// the stock no longer meets any one of them.
+    pub fn merge(self, other: MatchedShapes) -> MatchedShapes {
+        MatchedShapes {
+            arc: self.arc.or(other.arc),
+            pit: self.pit.or(other.pit),
+            stale: self.stale || other.stale,
+            unmet: [self.unmet, other.unmet].concat(),
+        }
     }
 }
 
@@ -2208,6 +2303,7 @@ pub fn shapes_to_draw(
         arc: arc_to_draw(lines, default_periods, period, candles, ma_lines, unmet),
         pit: pit_to_draw(lines, default_periods, period, candles, ma_lines, unmet),
         stale: unmet,
+        unmet: Vec::new(),
     }
 }
 
@@ -4208,5 +4304,90 @@ mod tests {
         assert!(holds("chart_app_pit_preset_ma_ok", "2026-11-13", &all));
         assert!(holds("chart_app_pit_preset_shape", "2026-10-23", &shape_only));
         assert!(!holds("chart_app_pit_preset_ma_low", "2026-10-23", &all));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn matched_by_all_keeps_what_every_bundle_matched() {
+        let filtered: HashMap<String, Vec<String>> = [
+            ("越振越强", vec!["sh600001", "sz000002", "sz000003"]),
+            ("下破变脸", vec!["sz000003", "sh600001", "sz000004"]),
+            ("ma", vec!["sz000003", "sz000005"]),
+            ("空", vec![]),
+        ]
+        .into_iter()
+        .map(|(name, secids)| (name.to_string(), names(&secids)))
+        .collect();
+        let both = |list: &[&str]| {
+            matched_by_all(&filtered, &names(list)).map(|set| {
+                let mut v: Vec<&str> = set.into_iter().collect();
+                v.sort();
+                v
+            })
+        };
+
+        // One bundle: its own list.
+        assert_eq!(both(&["ma"]), Some(vec!["sz000003", "sz000005"]));
+        // Two, and more: only what all of them matched, whatever the order.
+        assert_eq!(both(&["越振越强", "下破变脸"]), Some(vec!["sh600001", "sz000003"]));
+        assert_eq!(both(&["下破变脸", "越振越强"]), Some(vec!["sh600001", "sz000003"]));
+        assert_eq!(both(&["越振越强", "下破变脸", "ma"]), Some(vec!["sz000003"]));
+        assert_eq!(both(&["越振越强", "空"]), Some(vec![]));
+        // A bundle that has not been run leaves the list undecided.
+        assert_eq!(both(&["越振越强", "未筛选"]), None);
+        assert_eq!(both(&[]), None);
+    }
+
+    #[test]
+    fn also_choices_follow_renames_and_deletions() {
+        let mut also: HashMap<String, Vec<String>> = HashMap::from([
+            ("A".to_string(), names(&["B", "C"])),
+            ("B".to_string(), names(&["C"])),
+        ]);
+
+        rename_in_also(&mut also, "C", "C2");
+        rename_in_also(&mut also, "A", "A2");
+        assert_eq!(also.get("A2"), Some(&names(&["B", "C2"])));
+        assert_eq!(also.get("B"), Some(&names(&["C2"])));
+        assert!(!also.contains_key("A"));
+
+        // Nothing gone: nothing to save.
+        assert!(!prune_also(&mut also, |_| true));
+        // C2 deleted: it leaves A2's choice, and B is left with none.
+        assert!(prune_also(&mut also, |n| n != "C2"));
+        assert_eq!(also, HashMap::from([("A2".to_string(), names(&["B"]))]));
+        // A2 deleted: its own choice goes with it.
+        assert!(prune_also(&mut also, |n| n != "A2"));
+        assert!(also.is_empty());
+    }
+
+    #[test]
+    fn merged_shapes_take_each_kind_from_the_first_bundle_with_one() {
+        let pits = find_pit_structures(&candles_from_closes(&pit_closes(PIT_SHARP)));
+        let pits_slow = find_pit_structures(&candles_from_closes(&pit_closes(PIT_SLOW)));
+        let (pit, other_pit) = (pits.last().unwrap().clone(), pits_slow.last().unwrap().clone());
+        assert_ne!(pit, other_pit);
+
+        let none = MatchedShapes::default();
+        let first = MatchedShapes { pit: Some(pit.clone()), ..Default::default() };
+        let second = MatchedShapes {
+            pit: Some(other_pit),
+            stale: true,
+            unmet: vec!["越振越强".to_string()],
+            ..Default::default()
+        };
+
+        // A bundle without a structure on this chart doesn't hide another's.
+        assert_eq!(none.clone().merge(first.clone()), first);
+        assert_eq!(first.clone().merge(none.clone()), first);
+        // Two of a kind: the tab's own bundle comes first. A stock that no
+        // longer meets one of the bundles is stale.
+        let merged = first.merge(second);
+        assert_eq!(merged.pit, Some(pit));
+        assert!(merged.stale);
+        assert_eq!(merged.unmet, vec!["越振越强".to_string()]);
     }
 }

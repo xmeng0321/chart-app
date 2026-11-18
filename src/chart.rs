@@ -199,10 +199,14 @@ pub fn draw_chart(
         summary_y += 18.0;
     }
     if shapes.stale {
+        let which = match shapes.unmet.as_slice() {
+            [] => "筛选".to_string(),
+            names => format!(" {} ", names.join("、")),
+        };
         clipped.text(
             pos2(chart_rect.max.x - 10.0, summary_y),
             Align2::RIGHT_TOP,
-            "按最新行情已不满足该筛选的条件 (列表是上次筛选的结果)",
+            format!("按最新行情已不满足{which}的条件 (列表是上次筛选的结果)"),
             FontId::proportional(12.0),
             STALE_COLOR,
         );

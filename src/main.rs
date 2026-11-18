@@ -6,7 +6,7 @@ use data::*;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 const MODEL_OPTIONS: &[&str] = &[
     "auto",
@@ -191,9 +191,56 @@ fn stock_row(
 }
 
 /// Everything the structure overlay depends on: the stock, its timeframe and
-/// bar count (a sync appends bars), and the filter bundle in force — `None`
-/// outside a filter bundle's tab, where nothing is drawn.
-type OverlayKey = (Option<usize>, Period, usize, Option<String>);
+/// bar count (a sync appends bars), and the filter bundles behind the list on
+/// screen — none outside a filter bundle's tab, where nothing is drawn.
+type OverlayKey = (Option<usize>, Period, usize, Vec<String>);
+
+/// A bundle behind the list on screen, ready to say why a stock is in it.
+struct Listing {
+    name: String,
+    lines: Vec<FilterLine>,
+    periods: Vec<Period>,
+    /// Whether the stock meets the bundle on the data as it is now: the list
+    /// is what the last scan found, and a sync since may have moved it out.
+    still_matches: bool,
+}
+
+/// How each of `bundles` stands on the stock in `dir`. Bundles whose lines
+/// no longer parse are left out.
+fn listings(bundles: &[NamedFilter], dir: &Path, ma_windows: &[usize]) -> Vec<Listing> {
+    bundles
+        .iter()
+        .filter_map(|bundle| {
+            let lines = parse_filter_lines(&bundle.filters).ok()?;
+            let still_matches =
+                evaluate_filters_on_stock(dir, &lines, ma_windows, &bundle.periods);
+            Some(Listing {
+                name: bundle.name.clone(),
+                lines,
+                periods: bundle.periods.clone(),
+                still_matches,
+            })
+        })
+        .collect()
+}
+
+/// The structures to mark on a chart of `period` for a stock those bundles
+/// listed, naming the ones it no longer meets: see `shapes_to_draw` and
+/// `MatchedShapes::merge`.
+fn listed_shapes(
+    listings: &[Listing],
+    period: Period,
+    candles: &[Candle],
+    ma_lines: &[MaLine],
+) -> MatchedShapes {
+    listings
+        .iter()
+        .map(|l| MatchedShapes {
+            unmet: if l.still_matches { Vec::new() } else { vec![l.name.clone()] },
+            ..shapes_to_draw(&l.lines, &l.periods, period, candles, ma_lines, l.still_matches)
+        })
+        .fold(MatchedShapes::default(), MatchedShapes::merge)
+}
 
 struct ChartApp {
     stocks: Vec<(StockInfo, PathBuf)>,
@@ -225,6 +272,10 @@ struct ChartApp {
     /// On its tab, arrow keys walk its list and the chart marks the
     /// structures it matched. Persisted across launches.
     selected_filter_name: Option<String>,
+    /// Per bundle tab, the other bundles its list must also meet (同时满足):
+    /// the tab then lists only the stocks all of them matched. Persisted
+    /// (`also_filters.json`).
+    also_filters: HashMap<String, Vec<String>>,
     /// Open filter editor dialog, if any.
     filter_editor: Option<FilterEditor>,
     /// The structures drawn on the chart when the stock on screen was picked
@@ -289,6 +340,7 @@ impl ChartApp {
             filter_status: HashMap::new(),
             filter_receivers: HashMap::new(),
             selected_filter_name,
+            also_filters: load_also_filters(),
             filter_editor: None,
             overlay: MatchedShapes::default(),
             overlay_key: None,
@@ -316,12 +368,35 @@ impl ChartApp {
         }
     }
 
-    /// Matches of the bundle in focus (none if it has not been run).
-    fn focus_matches(&self) -> &[String] {
+    /// The bundles behind bundle `name`'s tab: itself, then those it must
+    /// also meet (同时满足).
+    fn list_names(&self, name: &str) -> Vec<String> {
+        std::iter::once(name.to_string())
+            .chain(self.also_filters.get(name).into_iter().flatten().cloned())
+            .collect()
+    }
+
+    /// The bundles behind the tab of the bundle in focus (see `list_names`).
+    fn focus_names(&self) -> Vec<String> {
         self.selected_filter_name
-            .as_ref()
-            .and_then(|name| self.filtered.get(name))
-            .map_or(&[], |matches| matches.as_slice())
+            .as_deref()
+            .map_or_else(Vec::new, |name| self.list_names(name))
+    }
+
+    /// Those bundles as configured now.
+    fn focus_bundles(&self) -> Vec<NamedFilter> {
+        let settings = load_settings();
+        self.focus_names()
+            .iter()
+            .filter_map(|name| settings.data_filters.iter().find(|f| &f.name == name))
+            .cloned()
+            .collect()
+    }
+
+    /// The list of the bundle in focus: the stocks it and every bundle it
+    /// must also meet matched (none while one of them has not been run).
+    fn focus_matches(&self) -> HashSet<&str> {
+        matched_by_all(&self.filtered, &self.focus_names()).unwrap_or_default()
     }
 
     /// Where the stock on screen is remembered: per tab, a filter bundle's
@@ -356,31 +431,32 @@ impl ChartApp {
         if self.stock_tab != StockTab::Filtered {
             return None;
         }
-        let name = self.selected_filter_name.as_ref()?;
-        let settings = load_settings();
-        let bundle = settings.data_filters.iter().find(|f| &f.name == name)?;
-        let lines = parse_filter_lines(&bundle.filters).ok()?;
         let (_, dir) = self.stocks.get(idx)?;
+        // The tab's own bundle, and those it must also meet.
+        let bundles = self.focus_bundles();
+        // The list is what the last scan found; if the data has moved on and
+        // the stock no longer matches, go where the structure it was picked
+        // for can still be seen.
+        let listings = listings(&bundles, dir, &self.ma_windows);
+        if listings.is_empty() {
+            return None;
+        }
 
         let other = match self.period {
             Period::Daily => Period::Weekly,
             Period::Weekly => Period::Daily,
         };
-        // The list is what the last scan found; if the data has moved on and
-        // the stock no longer matches, go where the structure it was picked
-        // for can still be seen.
-        let still_matches =
-            evaluate_filters_on_stock(dir, &lines, &self.ma_windows, &bundle.periods);
         let has_shape = |period: Period| {
             let (candles, ma_lines) = load_candles(dir, period, &self.ma_windows);
-            shapes_to_draw(&lines, &bundle.periods, period, &candles, &ma_lines, still_matches)
-                .has_structure()
+            listed_shapes(&listings, period, &candles, &ma_lines).has_structure()
         };
         if let Some(period) = [self.period, other].into_iter().find(|&p| has_shape(p)) {
             return Some(period);
         }
-        match bundle.active_periods().as_slice() {
-            [only] => Some(*only),
+        let reads = |p: Period| bundles.iter().any(|b| b.active_periods().contains(&p));
+        match (reads(Period::Daily), reads(Period::Weekly)) {
+            (true, false) => Some(Period::Daily),
+            (false, true) => Some(Period::Weekly),
             _ => None,
         }
     }
@@ -450,6 +526,11 @@ impl ChartApp {
     /// pass the search.
     fn visible_stock_indices(&self) -> Vec<usize> {
         let search_lower = self.search.to_lowercase();
+        let matches = if self.stock_tab == StockTab::Filtered {
+            self.focus_matches()
+        } else {
+            HashSet::new()
+        };
         self.stocks
             .iter()
             .enumerate()
@@ -457,7 +538,7 @@ impl ChartApp {
                 matches_search(info, &self.search, &search_lower)
                     && match self.stock_tab {
                         StockTab::Favorites => self.favorites.contains(&info.secid),
-                        StockTab::Filtered => self.focus_matches().contains(&info.secid),
+                        StockTab::Filtered => matches.contains(info.secid.as_str()),
                         StockTab::All => true,
                     }
             })
@@ -841,33 +922,26 @@ impl ChartApp {
     /// Keeps `overlay` in step with what is on screen. Cheap to call every
     /// frame: the structures are only recomputed when the key changes.
     fn refresh_overlay(&mut self) {
-        let bundle_name = (self.stock_tab == StockTab::Filtered)
-            .then(|| self.selected_filter_name.clone())
-            .flatten();
-        let key: OverlayKey = (self.selected, self.period, self.candles.len(), bundle_name);
+        let names = if self.stock_tab == StockTab::Filtered {
+            self.focus_names()
+        } else {
+            Vec::new()
+        };
+        let key: OverlayKey = (self.selected, self.period, self.candles.len(), names);
         if self.overlay_key.as_ref() == Some(&key) {
             return;
         }
-        let shapes = key.3.as_ref().and_then(|name| {
-            let settings = load_settings();
-            let bundle = settings.data_filters.iter().find(|f| &f.name == name)?;
-            let lines = parse_filter_lines(&bundle.filters).ok()?;
-            let (_, dir) = self.stocks.get(self.selected?)?;
-            // The stock is in the bundle's list, but that list is what the
-            // last scan found: a sync since may have moved it out of the
-            // conditions.
-            let still_matches =
-                evaluate_filters_on_stock(dir, &lines, &self.ma_windows, &bundle.periods);
-            Some(shapes_to_draw(
-                &lines,
-                &bundle.periods,
-                self.period,
-                &self.candles,
-                &self.ma_lines,
-                still_matches,
-            ))
-        });
-        self.overlay = shapes.unwrap_or_default();
+        let shapes = match self.selected.and_then(|i| self.stocks.get(i)) {
+            Some((_, dir)) if !key.3.is_empty() => {
+                // The stock is in the list, but that list is what the last
+                // scans found: a sync since may have moved it out of the
+                // conditions.
+                let listings = listings(&self.focus_bundles(), dir, &self.ma_windows);
+                listed_shapes(&listings, self.period, &self.candles, &self.ma_lines)
+            }
+            _ => MatchedShapes::default(),
+        };
+        self.overlay = shapes;
         self.overlay_key = Some(key);
     }
 
@@ -887,7 +961,7 @@ impl ChartApp {
         let clicked = {
             let search_lower = self.search.to_lowercase();
             let matches: HashSet<&str> = if self.stock_tab == StockTab::Filtered {
-                self.focus_matches().iter().map(String::as_str).collect()
+                self.focus_matches()
             } else {
                 HashSet::new()
             };
@@ -926,45 +1000,65 @@ impl ChartApp {
     }
 
     /// A filter bundle's tab: its own buttons and the timeframes it reads,
-    /// its own status line, and below them its own list of matches.
+    /// the other bundles its list must also meet (同时满足), its status line,
+    /// and below them its list: the stocks all those bundles matched.
     fn show_filter_tab(
         &mut self,
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         bundle: &NamedFilter,
+        all: &[NamedFilter],
         is_syncing: bool,
         scroll_to_selected: bool,
     ) {
         let dim = egui::Color32::from_gray(0x9E);
         let blue = egui::Color32::from_rgb(0x90, 0xCA, 0xF9);
+        let orange = egui::Color32::from_rgb(0xFF, 0xB7, 0x4D);
+        let red = egui::Color32::from_rgb(0xef, 0x53, 0x50);
+        let teal = egui::Color32::from_rgb(0x26, 0xa6, 0x9a);
         let small = |text: &str| egui::Button::new(egui::RichText::new(text).size(12.0));
         let note = |text: String, color| egui::RichText::new(text).size(11.0).color(color);
 
         let name = &bundle.name;
-        let matches = self.filtered.get(name);
-        let scanning = self.filter_receivers.contains_key(name);
+        let names = self.list_names(name);
+        let also = &names[1..];
+        // What the list shows; `None` while one of the bundles has no matches
+        // to intersect (not run since its conditions last changed).
+        let listed: Option<Vec<String>> = matched_by_all(&self.filtered, &names).map(|set| {
+            let mut listed: Vec<String> = set.into_iter().map(str::to_string).collect();
+            listed.sort();
+            listed
+        });
+        let scanning = |n: &String| self.filter_receivers.contains_key(n);
+        let any_scanning = names.iter().any(scanning);
 
         let (mut run, mut sync, mut edit) = (false, false, false);
         ui.horizontal(|ui| {
-            let text = if scanning {
+            let text = if any_scanning {
                 "筛选中..."
-            } else if matches.is_some() {
+            } else if listed.is_some() {
                 "重新筛选"
             } else {
                 "筛选"
             };
-            run = ui.add_enabled(!scanning, small(text)).clicked();
-            if scanning {
+            let button = ui.add_enabled(!any_scanning, small(text));
+            run = if also.is_empty() {
+                button
+            } else {
+                button.on_hover_text("连同同时满足的筛选一起重新筛选")
+            }
+            .clicked();
+            if any_scanning {
                 ui.spinner();
             }
-            let has_matches = matches.is_some_and(|m| !m.is_empty());
+            let has_matches = listed.as_ref().is_some_and(|m| !m.is_empty());
             sync = ui
                 .add_enabled(has_matches && !is_syncing, small("同步"))
                 .on_hover_text("更新这个列表里股票的行情数据")
                 .clicked();
             // Not during its scan: the matches would come back for
             // conditions that have changed since.
-            edit = ui.add_enabled(!scanning, small("编辑")).clicked();
+            edit = ui.add_enabled(!scanning(name), small("编辑")).clicked();
 
             // Which timeframe(s) it reads, derived from the per-line
             // `day:` / `week:` prefixes.
@@ -980,7 +1074,49 @@ impl ChartApp {
             ui.label(note(format!("[{period_label}]"), blue));
         });
 
-        match (self.filter_status.get(name), matches) {
+        // 同时满足: tick other bundles to keep only the stocks they matched too.
+        let mut toggled = None;
+        let mut clear = false;
+        let others: Vec<&NamedFilter> = all.iter().filter(|b| &b.name != name).collect();
+        if !others.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(note("同时满足".to_string(), dim));
+                let chosen = if also.is_empty() {
+                    "无".to_string()
+                } else {
+                    also.join("、")
+                };
+                let button =
+                    egui::Button::new(egui::RichText::new(format!("{chosen} ⏷")).size(12.0))
+                        .truncate();
+                let menu = egui::menu::menu_custom_button(ui, button, |ui| {
+                    for other in &others {
+                        let mut on = also.contains(&other.name);
+                        let count = match self.filtered.get(&other.name) {
+                            Some(matches) => format!("{} 只", matches.len()),
+                            None => "尚未筛选".to_string(),
+                        };
+                        let text = format!("{}  ({count})", other.name);
+                        if ui.checkbox(&mut on, text).changed() {
+                            toggled = Some(other.name.clone());
+                        }
+                    }
+                    if !also.is_empty() {
+                        ui.separator();
+                        if ui.button("全部取消").clicked() {
+                            clear = true;
+                            ui.close_menu();
+                        }
+                    }
+                });
+                // A long choice is cut short on the button.
+                if !also.is_empty() {
+                    menu.response.on_hover_text(also.join("、"));
+                }
+            });
+        }
+
+        match (self.filter_status.get(name), self.filtered.get(name)) {
             (
                 Some(FilterStatus::Running {
                     progress_pct,
@@ -999,22 +1135,13 @@ impl ChartApp {
                 }
             }
             (Some(FilterStatus::Done { matched, total }), _) => {
-                ui.label(note(
-                    format!("筛选完成: {matched}/{total} 只股票符合条件"),
-                    egui::Color32::from_rgb(0x26, 0xa6, 0x9a),
-                ));
+                ui.label(note(format!("筛选完成: {matched}/{total} 只股票符合条件"), teal));
             }
             (Some(FilterStatus::Error(msg)), _) => {
-                ui.label(note(
-                    format!("筛选错误: {msg}"),
-                    egui::Color32::from_rgb(0xef, 0x53, 0x50),
-                ));
+                ui.label(note(format!("筛选错误: {msg}"), red));
             }
             (Some(FilterStatus::Stale), _) => {
-                ui.label(note(
-                    "条件已修改，请重新筛选".to_string(),
-                    egui::Color32::from_rgb(0xFF, 0xB7, 0x4D),
-                ));
+                ui.label(note("条件已修改，请重新筛选".to_string(), orange));
             }
             // Not run this session: what the last run left behind.
             (None, Some(matches)) if matches.is_empty() => {
@@ -1027,17 +1154,67 @@ impl ChartApp {
                 ui.label(note("尚未筛选".to_string(), dim));
             }
         }
+        // The bundles it must also meet speak up only while their part of
+        // the list is missing or on its way.
+        for other in also {
+            let line = match (self.filter_status.get(other), self.filtered.get(other)) {
+                (Some(FilterStatus::Running { completed, total, .. }), _) => {
+                    Some((format!("{other}: 筛选中 {completed}/{total}"), blue))
+                }
+                (Some(FilterStatus::Error(msg)), _) => {
+                    Some((format!("{other}: 筛选错误: {msg}"), red))
+                }
+                (Some(FilterStatus::Stale), _) => {
+                    Some((format!("{other}: 条件已修改，请重新筛选"), orange))
+                }
+                (_, None) => Some((format!("{other}: 尚未筛选"), orange)),
+                _ => None,
+            };
+            if let Some((text, color)) = line {
+                ui.label(note(text, color));
+            }
+        }
+        if let (false, Some(listed)) = (also.is_empty(), &listed) {
+            ui.label(note(
+                format!("同时符合这 {} 个筛选: {} 只", names.len(), listed.len()),
+                teal,
+            ));
+        }
         ui.separator();
 
         if run {
-            self.run_filter(ctx, name);
+            for n in &names {
+                self.run_filter(ctx, n);
+            }
         }
         if sync {
-            let matches = self.filtered.get(name).cloned();
-            self.run_sync(ctx, matches);
+            self.run_sync(ctx, listed);
         }
         if edit {
             self.open_filter_editor(Some(name));
+        }
+        if toggled.is_some() || clear {
+            let mut chosen: Vec<String> = also.to_vec();
+            if let Some(other) = toggled {
+                if let Some(pos) = chosen.iter().position(|n| *n == other) {
+                    chosen.remove(pos);
+                } else {
+                    chosen.push(other);
+                }
+            }
+            if clear {
+                chosen.clear();
+            }
+            // Kept in tab order, whatever the order they were ticked in.
+            chosen.sort_by_key(|n| all.iter().position(|b| &b.name == n));
+            if chosen.is_empty() {
+                self.also_filters.remove(name);
+            } else {
+                self.also_filters.insert(name.clone(), chosen);
+            }
+            save_also_filters(&self.also_filters);
+            // The list on screen changed under the selection.
+            self.restore_selection_for_current_tab();
         }
         self.show_stock_list(ui, scroll_to_selected);
     }
@@ -1312,6 +1489,8 @@ impl ChartApp {
         if self.selected_filter_name.as_deref() == Some(old) {
             self.selected_filter_name = Some(new.to_string());
         }
+        rename_in_also(&mut self.also_filters, old, new);
+        save_also_filters(&self.also_filters);
     }
 
     fn delete_filter_bundle(&mut self, name: &str) {
@@ -1329,6 +1508,9 @@ impl ChartApp {
             .is_some()
         {
             save_last_selected(&self.last_selected_by_tab);
+        }
+        if prune_also(&mut self.also_filters, |n| n != name) {
+            save_also_filters(&self.also_filters);
         }
 
         // If it was in focus, the first bundle left takes over; with none
@@ -1463,8 +1645,7 @@ impl eframe::App for ChartApp {
                     self.filter_status
                         .insert(name.clone(), FilterStatus::Done { matched, total });
                     // The list on screen changed under the selection.
-                    if self.stock_tab == StockTab::Filtered
-                        && self.selected_filter_name.as_deref() == Some(name.as_str())
+                    if self.stock_tab == StockTab::Filtered && self.focus_names().contains(&name)
                     {
                         self.restore_selection_for_current_tab();
                     }
@@ -1562,18 +1743,34 @@ impl eframe::App for ChartApp {
                         let name = &bundle.name;
                         let active = self.stock_tab == StockTab::Filtered
                             && self.selected_filter_name.as_ref() == Some(name);
-                        // A scan under way shows on the tab itself; how
-                        // many stocks it matched is a hover away.
-                        let (label, hint) =
-                            match (self.filter_status.get(name), self.filtered.get(name)) {
-                                (Some(FilterStatus::Running { matched, .. }), _) => {
-                                    (format!("{name}…"), format!("筛选中，已匹配 {matched} 只"))
-                                }
-                                (_, Some(matches)) => {
-                                    (name.clone(), format!("{} 只股票符合条件", matches.len()))
-                                }
-                                (_, None) => (name.clone(), "尚未筛选".to_string()),
-                            };
+                        // A scan under way shows on the tab itself — its
+                        // own, or one of a bundle it must also meet; how many
+                        // stocks it lists is a hover away.
+                        let names = self.list_names(name);
+                        let running = |n: &String| {
+                            matches!(self.filter_status.get(n), Some(FilterStatus::Running { .. }))
+                        };
+                        let label = if names.iter().any(running) {
+                            format!("{name}…")
+                        } else {
+                            name.clone()
+                        };
+                        let hint = match (
+                            self.filter_status.get(name),
+                            matched_by_all(&self.filtered, &names),
+                        ) {
+                            (Some(FilterStatus::Running { matched, .. }), _) => {
+                                format!("筛选中，已匹配 {matched} 只")
+                            }
+                            _ if names.iter().any(running) => "筛选中".to_string(),
+                            (_, Some(listed)) if names.len() == 1 => {
+                                format!("{} 只股票符合条件", listed.len())
+                            }
+                            (_, Some(listed)) => {
+                                format!("{} 只同时符合 {}", listed.len(), names.join("、"))
+                            }
+                            (_, None) => "尚未筛选".to_string(),
+                        };
                         let tab = ui
                             .selectable_label(active, tab_text(&label, active))
                             .on_hover_text(hint);
@@ -1601,6 +1798,15 @@ impl eframe::App for ChartApp {
                         Some(first) => (StockTab::Filtered, Some(first.name.clone())),
                         None => (StockTab::All, None),
                     });
+                }
+                // Likewise a bundle that is gone leaves the 同时满足 choices.
+                let exists = |n: &str| settings.data_filters.iter().any(|b| b.name == n);
+                if prune_also(&mut self.also_filters, exists) {
+                    save_also_filters(&self.also_filters);
+                    self.overlay_key = None;
+                    if self.stock_tab == StockTab::Filtered {
+                        self.restore_selection_for_current_tab();
+                    }
                 }
                 if let Some((tab, bundle)) = open_tab {
                     self.stock_tab = tab;
@@ -1714,7 +1920,8 @@ impl eframe::App for ChartApp {
                     .find(|b| Some(&b.name) == self.selected_filter_name.as_ref());
                 match open_bundle {
                     Some(bundle) => {
-                        self.show_filter_tab(ctx, ui, bundle, is_syncing, scroll_to_selected);
+                        let all = &settings.data_filters;
+                        self.show_filter_tab(ctx, ui, bundle, all, is_syncing, scroll_to_selected);
                     }
                     None => self.show_stock_list(ui, scroll_to_selected),
                 }
