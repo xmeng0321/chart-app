@@ -1,4 +1,6 @@
-use crate::data::{ArcStructure, Candle, MaLine, MatchedShapes, PitStructure, TradeAgentResult};
+use crate::data::{
+    ArcStructure, Candle, MaLine, MatchedShapes, Period, PitStructure, TradeAgentResult,
+};
 use eframe::egui::*;
 
 // TradingView dark theme colors
@@ -103,10 +105,6 @@ pub fn ma_color(period: usize) -> Color32 {
     }
 }
 
-/// `price_level_step` is the fractional gap between consecutive horizontal
-/// price guide lines — e.g. 0.2 for 20 %-per-line on daily charts, 0.3 on
-/// weekly charts.
-///
 /// `shapes` are the structures found in `candles` (see `data::ArcStructure`,
 /// `data::PitStructure`) to mark on the chart, so a stock picked by an `arc_*`
 /// or `pit_*` filter shows why — and a note when it no longer meets that
@@ -118,7 +116,7 @@ pub fn draw_chart(
     ma_visible: &[bool],
     state: &mut ChartState,
     title: &str,
-    price_level_step: f64,
+    period: Period,
     shapes: &MatchedShapes,
 ) {
     if candles.is_empty() {
@@ -172,7 +170,8 @@ pub fn draw_chart(
     // Grid
     draw_grid(&clipped, &chart_rect, state, candles);
 
-    // Percentage price levels anchored to the global lowest low.
+    // Wider percentage guide spacing on weekly charts.
+    let price_level_step = if period == Period::Weekly { 0.3 } else { 0.2 };
     draw_price_levels(&clipped, candles, state, &chart_rect, price_level_step);
 
     // Volume (behind candles)
@@ -217,7 +216,7 @@ pub fn draw_chart(
 
     // Axes (outside clip)
     draw_price_axis(&painter, &price_axis_rect, state);
-    draw_time_axis(&painter, &time_axis_rect, candles, state);
+    draw_time_axis(&painter, &time_axis_rect, candles, state, period);
 
     // Crosshair & OHLCV tooltip
     let hovered_idx = if let Some(pos) = response.hover_pos() {
@@ -798,10 +797,18 @@ fn draw_price_axis(painter: &Painter, rect: &Rect, state: &ChartState) {
     }
 }
 
-fn draw_time_axis(painter: &Painter, rect: &Rect, candles: &[Candle], state: &ChartState) {
+fn draw_time_axis(
+    painter: &Painter,
+    rect: &Rect,
+    candles: &[Candle],
+    state: &ChartState,
+    period: Period,
+) {
     painter.rect_filled(*rect, 0.0, BG_COLOR);
 
     let time_step = nice_step(state.candles_in_view, 8).max(1.0);
+    let half_label_width = if period.is_intraday() { 43.0 } else { 30.0 };
+    let mut last_label_x = f32::NEG_INFINITY;
     let first = ((state.offset / time_step).ceil() * time_step) as i64;
     let last = (state.offset + state.candles_in_view) as i64;
     let mut idx = first;
@@ -809,9 +816,16 @@ fn draw_time_axis(painter: &Painter, rect: &Rect, candles: &[Candle], state: &Ch
         if idx >= 0 && (idx as usize) < candles.len() {
             let frac = (idx as f64 + 0.5 - state.offset) / state.candles_in_view;
             let x = rect.min.x + frac as f32 * rect.width();
-            if x > rect.min.x + 30.0 && x < rect.max.x - 30.0 {
+            if x > rect.min.x + half_label_width
+                && x < rect.max.x - half_label_width
+                && x - last_label_x >= 2.0 * half_label_width
+            {
                 let ts = &candles[idx as usize].timestamp;
-                let label = if ts.len() > 10 { &ts[..10] } else { ts };
+                let label = if period.is_intraday() {
+                    ts.get(5..16).unwrap_or(ts)
+                } else {
+                    ts.get(..10).unwrap_or(ts)
+                };
                 painter.text(
                     pos2(x, rect.center().y),
                     Align2::CENTER_CENTER,
@@ -819,6 +833,7 @@ fn draw_time_axis(painter: &Painter, rect: &Rect, candles: &[Candle], state: &Ch
                     FontId::proportional(10.0),
                     TEXT_DIM,
                 );
+                last_label_x = x;
             }
         }
         idx += time_step as i64;
@@ -880,9 +895,11 @@ fn draw_crosshair(
     // Time label on axis
     if snapped < candles.len() {
         let ts = &candles[snapped].timestamp;
-        let tw2 = ts.len() as f32 * 7.0 + 12.0;
+        let tw2 = (ts.len() as f32 * 7.0 + 12.0).min(time_rect.width().max(0.0));
+        let label_x = (snap_x - tw2 / 2.0)
+            .clamp(time_rect.min.x, (time_rect.max.x - tw2).max(time_rect.min.x));
         let lbl2 = Rect::from_min_size(
-            pos2(snap_x - tw2 / 2.0, time_rect.min.y + 1.0),
+            pos2(label_x, time_rect.min.y + 1.0),
             vec2(tw2, TIME_AXIS_HEIGHT - 2.0),
         );
         painter.rect_filled(lbl2, 3.0, LABEL_BG);

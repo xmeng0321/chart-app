@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 pub fn favorites_path() -> PathBuf {
@@ -587,16 +587,16 @@ pub fn save_settings(settings: &AppSettings) {
 pub enum SyncStatus {
     Idle,
     Running {
+        period: Period,
         progress_pct: f32,
         completed: usize,
         total: usize,
         current_stock: String,
     },
     Done {
-        success: usize,
-        failed: usize,
+        daily: Result<(usize, usize), String>,
+        minute: (usize, usize),
     },
-    Error(String),
 }
 
 pub enum SyncMessage {
@@ -606,7 +606,21 @@ pub enum SyncMessage {
         total: usize,
         stock_label: String,
     },
-    Finished(Result<(usize, usize), String>),
+    MinutesStarted {
+        data_dir: PathBuf,
+        total: usize,
+    },
+    MinuteProgress {
+        completed: usize,
+        total: usize,
+        stock_label: String,
+        stock_dir: PathBuf,
+        result: Result<(), String>,
+    },
+    Finished {
+        daily: Result<(usize, usize), String>,
+        minute: (usize, usize),
+    },
 }
 
 /// Parse stock-dl progress line: `[45.32% 234/516] 600519 贵州茅台 -> ...`
@@ -730,7 +744,7 @@ pub struct TradeAgentResult {
     pub explanation: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct Candle {
     pub timestamp: String,
     pub open: f64,
@@ -739,6 +753,16 @@ pub struct Candle {
     pub low: f64,
     pub volume: f64,
     pub amount: Option<f64>,
+}
+
+impl Candle {
+    fn add_bar(&mut self, next: &Self) {
+        self.close = next.close;
+        self.high = self.high.max(next.high);
+        self.low = self.low.min(next.low);
+        self.volume += next.volume;
+        self.amount = self.amount.zip(next.amount).map(|(a, b)| a + b);
+    }
 }
 
 #[derive(Clone)]
@@ -752,16 +776,36 @@ pub struct MaLine {
 pub enum Period {
     Daily,
     Weekly,
+    FiveMinutes,
+    ThirtyMinutes,
+    Hourly,
 }
 
 impl Period {
+    pub const CHART_PERIODS: [Self; 5] = [
+        Self::Daily,
+        Self::Weekly,
+        Self::FiveMinutes,
+        Self::ThirtyMinutes,
+        Self::Hourly,
+    ];
+
     pub fn label(&self) -> &str {
         match self {
             Period::Daily => "日线",
             Period::Weekly => "周线",
+            Period::FiveMinutes => "5分钟",
+            Period::ThirtyMinutes => "30分钟",
+            Period::Hourly => "1小时",
         }
     }
+
+    pub fn is_intraday(self) -> bool {
+        matches!(self, Self::FiveMinutes | Self::ThirtyMinutes | Self::Hourly)
+    }
 }
+
+const FIVE_MINUTE_CSV: &str = "5min.csv";
 
 pub fn load_stock_list(data_dir: &Path) -> Vec<(StockInfo, PathBuf)> {
     let mut stocks = Vec::new();
@@ -787,10 +831,18 @@ pub fn load_candles(
     period: Period,
     ma_windows: &[usize],
 ) -> (Vec<Candle>, Vec<MaLine>) {
-    let daily = read_daily_csv(&stock_dir.join("daily.csv"));
+    let read = |file| read_candle_csv(&stock_dir.join(file)).unwrap_or_default();
     let candles = match period {
-        Period::Daily => daily,
-        Period::Weekly => aggregate_weekly(&daily),
+        Period::Daily => read("daily.csv"),
+        Period::Weekly => aggregate_weekly(&read("daily.csv")),
+        Period::FiveMinutes | Period::ThirtyMinutes | Period::Hourly => {
+            let bars = sorted_five_minute_bars(read(FIVE_MINUTE_CSV));
+            match period {
+                Period::ThirtyMinutes => aggregate_intraday(bars.into_values(), 30),
+                Period::Hourly => aggregate_intraday(bars.into_values(), 60),
+                _ => bars.into_values().collect(),
+            }
+        }
     };
 
     let ma_lines = build_ma_lines(&candles, ma_windows);
@@ -809,17 +861,11 @@ fn build_ma_lines(candles: &[Candle], ma_windows: &[usize]) -> Vec<MaLine> {
         .collect()
 }
 
-fn read_daily_csv(csv_path: &Path) -> Vec<Candle> {
+fn read_candle_csv(csv_path: &Path) -> csv::Result<Vec<Candle>> {
     let mut candles = Vec::new();
 
-    let Ok(mut rdr) = csv::Reader::from_path(csv_path) else {
-        return candles;
-    };
-
-    let headers = match rdr.headers() {
-        Ok(h) => h.clone(),
-        Err(_) => return candles,
-    };
+    let mut rdr = csv::Reader::from_path(csv_path)?;
+    let headers = rdr.headers()?;
 
     let mut col_map: HashMap<String, usize> = HashMap::new();
     for (i, h) in headers.iter().enumerate() {
@@ -869,7 +915,187 @@ fn read_daily_csv(csv_path: &Path) -> Vec<Candle> {
         });
     }
 
-    candles
+    Ok(candles)
+}
+
+pub fn write_candle_csv<'a>(
+    output: impl std::io::Write,
+    candles: impl IntoIterator<Item = &'a Candle>,
+) -> csv::Result<()> {
+    let mut writer = csv::Writer::from_writer(output);
+    for candle in candles {
+        writer.serialize(candle)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct SinaMinuteBar {
+    day: String,
+    open: String,
+    close: String,
+    high: String,
+    low: String,
+    volume: String,
+    amount: Option<String>,
+}
+
+fn parse_sina_minute_bars(body: &[u8]) -> Result<Vec<Candle>, String> {
+    let rows = serde_json::from_slice::<Option<Vec<SinaMinuteBar>>>(body)
+        .map_err(|e| format!("无法读取新浪财经的5分钟数据：{e}"))?
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return Err("新浪财经未返回5分钟数据".into());
+    }
+
+    rows.into_iter()
+        .map(|row| {
+            let invalid = || format!("无效的5分钟 K 线：{}", row.day);
+            let (date, end, _) = five_minute_slot(&row.day).ok_or_else(invalid)?;
+            let number = |value: &str| value.parse::<f64>().ok().filter(|n| n.is_finite());
+            let open = number(&row.open).ok_or_else(invalid)?;
+            let close = number(&row.close).ok_or_else(invalid)?;
+            let high = number(&row.high).ok_or_else(invalid)?;
+            let low = number(&row.low).ok_or_else(invalid)?;
+            let volume = number(&row.volume).ok_or_else(invalid)?;
+            if high < open.max(close) || low > open.min(close) || low <= 0.0 || volume < 0.0 {
+                return Err(invalid());
+            }
+            let amount = row.amount.as_deref().and_then(number).filter(|n| *n > 0.0);
+            Ok(Candle {
+                timestamp: minute_timestamp(date, end),
+                open,
+                close,
+                high,
+                low,
+                // Match the daily downloader's units: lots and ten thousand yuan.
+                volume: volume / 100.0,
+                amount: amount.map(|n| n / 10_000.0),
+            })
+        })
+        .collect()
+}
+
+pub fn download_five_minute_bars(secid: &str, stock_dir: &Path) -> Result<(), String> {
+    if !matches!(secid.get(..2), Some("sh" | "sz" | "bj"))
+        || !secid
+            .get(2..)
+            .is_some_and(|code| code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(format!("不支持的股票代码：{secid}"));
+    }
+
+    let url = format!(
+        "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData?symbol={secid}&scale=5&ma=no&datalen=1023"
+    );
+    let output = std::process::Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "12",
+            "--retry",
+            "1",
+            "--retry-all-errors",
+        ])
+        .arg(url)
+        .output()
+        .map_err(|e| format!("无法启动 curl：{e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "新浪财经请求失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let bars = parse_sina_minute_bars(&output.stdout)?;
+    // Manual, automatic and batch syncs can finish a request for the same
+    // stock together. Serialize the cache updates while keeping HTTP parallel.
+    static CACHE_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = CACHE_WRITE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    merge_five_minute_csv(stock_dir, bars)
+}
+
+fn merge_five_minute_csv(stock_dir: &Path, bars: Vec<Candle>) -> Result<(), String> {
+    let path = stock_dir.join(FIVE_MINUTE_CSV);
+    let existing = match read_candle_csv(&path) {
+        Ok(bars) => bars,
+        Err(e) => match e.kind() {
+            csv::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            _ => return Err(format!("无法读取 {}：{e}", path.display())),
+        },
+    };
+    let mut merged = sorted_five_minute_bars(existing);
+    merged.extend(sorted_five_minute_bars(bars));
+
+    let mut temp = tempfile::NamedTempFile::new_in(stock_dir)
+        .map_err(|e| format!("无法创建5分钟缓存：{e}"))?;
+    write_candle_csv(temp.as_file_mut(), merged.values())
+        .map_err(|e| format!("无法写入5分钟缓存：{e}"))?;
+    temp.persist(&path)
+        .map_err(|e| format!("无法保存 {}：{e}", path.display()))?;
+    Ok(())
+}
+
+/// Minute bars are stamped by their end time in the exchange's local time.
+fn five_minute_slot(timestamp: &str) -> Option<(&str, u32, u32)> {
+    let (date, time) = timestamp.split_once([' ', 'T'])?;
+    if date.len() != 10 || !date.is_ascii() {
+        return None;
+    }
+    parse_ymd(date)?;
+    let (hour, minute) = time.get(..5)?.split_once(':')?;
+    if hour.len() != 2 || minute.len() != 2 || !matches!(&time[5..], "" | ":00") {
+        return None;
+    }
+    let minute: u32 = minute.parse().ok()?;
+    let hour: u32 = hour.parse().ok()?;
+    if minute >= 60 || hour >= 24 || minute % 5 != 0 {
+        return None;
+    }
+    let end = hour * 60 + minute;
+    let session_start = match end {
+        575..=690 => 570, // 09:30–11:30
+        785..=900 => 780, // 13:00–15:00
+        _ => return None,
+    };
+    Some((date, end, session_start))
+}
+
+fn minute_timestamp(date: &str, minute_of_day: u32) -> String {
+    format!("{date} {:02}:{:02}", minute_of_day / 60, minute_of_day % 60)
+}
+
+fn sorted_five_minute_bars(bars: Vec<Candle>) -> BTreeMap<String, Candle> {
+    bars.into_iter()
+        .filter_map(|mut bar| {
+            let (date, end, _) = five_minute_slot(&bar.timestamp)?;
+            bar.timestamp = minute_timestamp(date, end);
+            Some((bar.timestamp.clone(), bar))
+        })
+        .collect()
+}
+
+fn aggregate_intraday(bars: impl Iterator<Item = Candle>, minutes: u32) -> Vec<Candle> {
+    let mut aggregated: Vec<Candle> = Vec::new();
+    for mut bar in bars {
+        let Some((date, end, session_start)) = five_minute_slot(&bar.timestamp) else {
+            continue;
+        };
+        let bucket_end = session_start + (end - session_start).div_ceil(minutes) * minutes;
+        bar.timestamp = minute_timestamp(date, bucket_end);
+        match aggregated.last_mut() {
+            Some(last) if last.timestamp == bar.timestamp => last.add_bar(&bar),
+            _ => aggregated.push(bar),
+        }
+    }
+    aggregated
 }
 
 /// Group daily candles into ISO weeks (Mon–Sun) starting from the first day's
@@ -888,14 +1114,7 @@ fn aggregate_weekly(daily: &[Candle]) -> Vec<Candle> {
         match current_week {
             Some(cw) if cw == week => {
                 let last = weekly.last_mut().unwrap();
-                last.high = last.high.max(c.high);
-                last.low = last.low.min(c.low);
-                last.close = c.close;
-                last.volume += c.volume;
-                last.amount = match (last.amount, c.amount) {
-                    (Some(lhs), Some(rhs)) => Some(lhs + rhs),
-                    _ => None,
-                };
+                last.add_bar(c);
                 last.timestamp = c.timestamp.clone();
             }
             _ => {
@@ -2398,8 +2617,14 @@ impl StockData<'_> {
     /// Same result as `load_candles`, but the CSV is read only once: weekly
     /// candles are aggregated from the daily ones already in memory.
     fn load(&mut self, period: Period) {
+        if period.is_intraday() {
+            self.candles
+                .entry(period)
+                .or_insert_with(|| load_candles(self.dir, period, self.windows));
+            return;
+        }
         if !self.candles.contains_key(&Period::Daily) {
-            let daily = read_daily_csv(&self.dir.join("daily.csv"));
+            let daily = read_candle_csv(&self.dir.join("daily.csv")).unwrap_or_default();
             let ma_lines = build_ma_lines(&daily, self.windows);
             self.candles.insert(Period::Daily, (daily, ma_lines));
         }
@@ -3191,6 +3416,100 @@ mod tests {
         }"#;
         let parsed: AppSettings = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.dl.concurrency, 8);
+    }
+
+    #[test]
+    fn minute_download_merges_overlapping_bars_and_keeps_cached_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = br#"[
+            {"day":"2026-01-05 09:35:00","open":"10","close":"11","high":"12","low":"9","volume":"1000","amount":"11000"},
+            {"day":"2026-01-05 09:40:00","open":"11","close":"12","high":"13","low":"10","volume":"2000","amount":"24000"}
+        ]"#;
+        merge_five_minute_csv(dir.path(), parse_sina_minute_bars(initial).unwrap()).unwrap();
+
+        let update = br#"[
+            {"day":"2026-01-05 09:45:00","open":"12","close":"13","high":"14","low":"11","volume":"3000"},
+            {"day":"2026-01-05 09:40:00","open":"11","close":"12.5","high":"13","low":"10","volume":"2500","amount":"30000"}
+        ]"#;
+        let bars = parse_sina_minute_bars(update).unwrap();
+        merge_five_minute_csv(dir.path(), bars.clone()).unwrap();
+        merge_five_minute_csv(dir.path(), bars).unwrap();
+
+        let (candles, _) = load_candles(dir.path(), Period::FiveMinutes, &[]);
+        assert_eq!(candles.len(), 3);
+        assert_eq!(candles[0].timestamp, "2026-01-05 09:35");
+        assert_eq!(candles[1].timestamp, "2026-01-05 09:40");
+        assert_eq!(candles[1].close, 12.5);
+        assert_eq!(candles[1].volume, 25.0);
+        assert_eq!(candles[1].amount, Some(3.0));
+        assert_eq!(candles[2].timestamp, "2026-01-05 09:45");
+        assert_eq!(candles[2].amount, None);
+        assert!(parse_sina_minute_bars(b"null").is_err());
+    }
+
+    #[test]
+    fn intraday_candles_follow_each_trading_session_and_use_aggregated_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FIVE_MINUTE_CSV);
+        std::fs::write(
+            path,
+            "date,open,close,high,low,volume,amount\n\
+             2026-01-05 13:05,20,21,22,19,70,7\n\
+             2026-01-05 09:35,10,11,13,8,10,1\n\
+             2026-01-05 10:00,11,12,14,10,20,2\n\
+             2026-01-05 10:05,12,13,15,11,30,3\n\
+             2026-01-05 10:30,13,14,16,12,40,4\n\
+             2026-01-05 10:35,14,15,17,13,50,5\n\
+             2026-01-05 11:30,15,16,18,14,60,6\n\
+             2026-01-05 14:00,21,22,23,20,80,8\n\
+             2026-01-05 14:05,22,23,24,21,90,9\n\
+             2026-01-05 15:00,23,24,25,22,100,10\n\
+             2026-01-06 09:35,24,25,26,23,110,11\n",
+        )
+        .unwrap();
+
+        let (hourly, hourly_ma) = load_candles(dir.path(), Period::Hourly, &[2]);
+        let times: Vec<_> = hourly.iter().map(|bar| bar.timestamp.as_str()).collect();
+        assert_eq!(
+            times,
+            [
+                "2026-01-05 10:30",
+                "2026-01-05 11:30",
+                "2026-01-05 14:00",
+                "2026-01-05 15:00",
+                "2026-01-06 10:30"
+            ]
+        );
+        let first = &hourly[0];
+        assert_eq!(
+            (first.open, first.close, first.high, first.low),
+            (10.0, 14.0, 16.0, 8.0)
+        );
+        assert_eq!((first.volume, first.amount), (100.0, Some(10.0)));
+        assert_eq!(hourly_ma[0].values[1], 15.0);
+
+        let (half_hours, _) = load_candles(dir.path(), Period::ThirtyMinutes, &[]);
+        let times: Vec<_> = half_hours
+            .iter()
+            .map(|bar| bar.timestamp.as_str())
+            .collect();
+        assert_eq!(
+            times,
+            [
+                "2026-01-05 10:00",
+                "2026-01-05 10:30",
+                "2026-01-05 11:00",
+                "2026-01-05 11:30",
+                "2026-01-05 13:30",
+                "2026-01-05 14:00",
+                "2026-01-05 14:30",
+                "2026-01-05 15:00",
+                "2026-01-06 10:00"
+            ]
+        );
+        assert_eq!(half_hours[0].volume, 30.0);
+        assert_eq!(half_hours[1].open, 12.0);
+        assert_eq!(half_hours[4].open, 20.0);
     }
 
     #[test]

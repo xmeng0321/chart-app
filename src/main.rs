@@ -195,6 +195,17 @@ fn stock_row(
 /// screen — none outside a filter bundle's tab, where nothing is drawn.
 type OverlayKey = (Option<usize>, Period, usize, Vec<String>);
 
+struct MinuteDownload {
+    stock_dir: PathBuf,
+    receiver: mpsc::Receiver<Result<(), String>>,
+}
+
+struct AutoSyncResult {
+    stock_dir: PathBuf,
+    daily: Result<(), String>,
+    minute: Result<(), String>,
+}
+
 /// A bundle behind the list on screen, ready to say why a stock is in it.
 struct Listing {
     name: String,
@@ -243,6 +254,7 @@ fn listed_shapes(
 }
 
 struct ChartApp {
+    data_dir_override: Option<PathBuf>,
     stocks: Vec<(StockInfo, PathBuf)>,
     search: String,
     selected: Option<usize>,
@@ -252,7 +264,6 @@ struct ChartApp {
     ma_visible: Vec<bool>,
     ma_windows: Vec<usize>,
     chart_state: ChartState,
-    csv_path: Option<PathBuf>,
     agent_receiver: Option<mpsc::Receiver<Result<TradeAgentResult, String>>>,
     model: String,
     csv_as_chart: bool,
@@ -260,6 +271,8 @@ struct ChartApp {
     favorites: Vec<String>,
     sync_status: SyncStatus,
     sync_receiver: Option<mpsc::Receiver<SyncMessage>>,
+    minute_download: Option<MinuteDownload>,
+    minute_download_errors: HashMap<PathBuf, String>,
     /// Cached matches of every filter bundle, by bundle name (what
     /// `filtered.json` holds). A bundle without an entry has not been run
     /// since it was created or its conditions last changed.
@@ -291,10 +304,9 @@ struct ChartApp {
     /// One-shot flag: if true, the stock list scrolls to reveal the currently
     /// selected row on the next frame.
     scroll_to_selected: bool,
-    /// Secid whose per-stock auto-sync (`stock-dl --codes <code>`) is currently
-    /// running in the background. `None` means no auto-sync in flight.
+    /// Secid whose per-stock automatic sync is running in the background.
     auto_sync_secid: Option<String>,
-    auto_sync_receiver: Option<mpsc::Receiver<(String, Result<(), String>)>>,
+    auto_sync_receiver: Option<mpsc::Receiver<AutoSyncResult>>,
     /// Secids we've already attempted to auto-sync this session. We fire at
     /// most once per stock per run so arrow-keying through the list doesn't
     /// spawn a stock-dl process for every row.
@@ -302,12 +314,14 @@ struct ChartApp {
 }
 
 impl ChartApp {
-    fn new(cc: &eframe::CreationContext<'_>, data_dir: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, data_dir_override: Option<PathBuf>) -> Self {
         setup_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         let settings = load_settings();
-        let data_dir = data_dir.unwrap_or_else(|| settings_data_dir(&settings));
+        let data_dir = data_dir_override
+            .clone()
+            .unwrap_or_else(|| settings_data_dir(&settings));
 
         let stocks = load_stock_list(&data_dir);
         let favorites = load_favorites();
@@ -319,6 +333,7 @@ impl ChartApp {
             .or_else(|| settings.data_filters.first().map(|f| f.name.clone()));
         let filtered = load_all_filtered();
         let mut app = Self {
+            data_dir_override,
             stocks,
             search: String::new(),
             selected: None,
@@ -328,7 +343,6 @@ impl ChartApp {
             ma_visible: Vec::new(),
             ma_windows: settings.ma.clone(),
             chart_state: ChartState::new(),
-            csv_path: None,
             agent_receiver: None,
             model: "auto".to_string(),
             csv_as_chart: false,
@@ -336,6 +350,8 @@ impl ChartApp {
             favorites,
             sync_status: SyncStatus::Idle,
             sync_receiver: None,
+            minute_download: None,
+            minute_download_errors: HashMap::new(),
             filtered,
             filter_status: HashMap::new(),
             filter_receivers: HashMap::new(),
@@ -428,7 +444,7 @@ impl ChartApp {
     /// current one if both do), otherwise the bundle's timeframe when it reads
     /// only one. `None` leaves the chart on the timeframe it is on.
     fn matched_period(&self, idx: usize) -> Option<Period> {
-        if self.stock_tab != StockTab::Filtered {
+        if self.stock_tab != StockTab::Filtered || self.period.is_intraday() {
             return None;
         }
         let (_, dir) = self.stocks.get(idx)?;
@@ -442,15 +458,16 @@ impl ChartApp {
             return None;
         }
 
-        let other = match self.period {
-            Period::Daily => Period::Weekly,
-            Period::Weekly => Period::Daily,
+        let periods = if self.period == Period::Weekly {
+            [Period::Weekly, Period::Daily]
+        } else {
+            [Period::Daily, Period::Weekly]
         };
         let has_shape = |period: Period| {
             let (candles, ma_lines) = load_candles(dir, period, &self.ma_windows);
             listed_shapes(&listings, period, &candles, &ma_lines).has_structure()
         };
-        if let Some(period) = [self.period, other].into_iter().find(|&p| has_shape(p)) {
+        if let Some(period) = periods.into_iter().find(|&p| has_shape(p)) {
             return Some(period);
         }
         let reads = |p: Period| bundles.iter().any(|b| b.active_periods().contains(&p));
@@ -499,9 +516,6 @@ impl ChartApp {
             let had_data_len = self.candles.len();
             let (_, dir) = &self.stocks[idx];
             let (candles, ma_lines) = load_candles(dir, self.period, &self.ma_windows);
-            // Only daily.csv exists on disk — weekly candles are computed
-            // in-memory, so trade-agent always gets the daily file.
-            self.csv_path = Some(dir.join("daily.csv"));
             self.candles = candles;
             self.ma_visible = vec![true; ma_lines.len()];
             self.ma_lines = ma_lines;
@@ -552,12 +566,15 @@ impl ChartApp {
             _ => return,
         };
 
-        let Some(csv_path) = &self.csv_path else {
+        let Some((_, stock_dir)) = self.selected.and_then(|idx| self.stocks.get(idx)) else {
+            return;
+        };
+        let Some(selection) = self.candles.get(start..=end) else {
             return;
         };
 
-        let start_date = &self.candles[start].timestamp;
-        let end_date = &self.candles[end].timestamp;
+        let start_date = &selection[0].timestamp;
+        let end_date = &selection[selection.len() - 1].timestamp;
         // Extract date part (first 10 chars: YYYY-MM-DD)
         let start_date = if start_date.len() >= 10 {
             &start_date[..10]
@@ -570,7 +587,10 @@ impl ChartApp {
             end_date
         };
         let date_range = format!("{}:{}", start_date, end_date);
-        let csv_path = csv_path.clone();
+        // trade-agent takes whole dates. Give it the exact selected bars for
+        // intraday charts, and the underlying daily CSV for day/week charts.
+        let intraday_selection = self.period.is_intraday().then(|| selection.to_vec());
+        let daily_path = stock_dir.join("daily.csv");
         let ctx = ctx.clone();
         let model = self.model.clone();
         let csv_as_chart = self.csv_as_chart;
@@ -586,17 +606,32 @@ impl ChartApp {
             String::new()
         };
         let chart_arg = format!(" --csv_as_chart {}", csv_as_chart);
-        eprintln!(
-            "\n[trade-agent] Running: trade-agent {} --date-range {}{}{}",
-            csv_path.display(),
-            date_range,
-            model_arg,
-            chart_arg
-        );
-
         std::thread::spawn(move || {
+            let temp_csv = intraday_selection.map(|bars| -> csv::Result<_> {
+                let mut file = tempfile::Builder::new().suffix(".csv").tempfile()?;
+                write_candle_csv(file.as_file_mut(), &bars)?;
+                Ok(file)
+            });
+            let temp_csv = match temp_csv.transpose() {
+                Ok(file) => file,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("无法写入选中的 K 线：{e}")));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let csv_path = temp_csv
+                .as_ref()
+                .map_or(daily_path.as_path(), |file| file.path());
+            eprintln!(
+                "\n[trade-agent] Running: trade-agent {} --date-range {}{}{}",
+                csv_path.display(),
+                date_range,
+                model_arg,
+                chart_arg
+            );
             let mut cmd = std::process::Command::new("trade-agent");
-            cmd.arg(csv_path.to_str().unwrap_or(""))
+            cmd.arg(csv_path)
                 .arg("--date-range")
                 .arg(&date_range)
                 .arg("--csv_as_chart")
@@ -636,13 +671,111 @@ impl ChartApp {
         });
     }
 
-    /// Runs stock-dl in the background: for `symbols` only (the favourites,
-    /// or one bundle's matches), or for every stock when `None`.
+    fn start_minute_download(&mut self, ctx: &egui::Context) {
+        let Some((info, dir)) = self.selected.and_then(|idx| self.stocks.get(idx)) else {
+            return;
+        };
+        if self.minute_download.is_some() {
+            return;
+        }
+
+        let (tx, receiver) = mpsc::channel();
+        self.minute_download = Some(MinuteDownload {
+            stock_dir: dir.clone(),
+            receiver,
+        });
+        self.minute_download_errors.remove(dir);
+        let secid = info.secid.clone();
+        let dir = dir.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(download_five_minute_bars(&secid, &dir));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_minute_download(&mut self) {
+        let Some(download) = &self.minute_download else {
+            return;
+        };
+        let result = match download.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("5分钟下载已中断".into()),
+        };
+        let dir = download.stock_dir.clone();
+        self.minute_download = None;
+        self.apply_minute_sync(dir, result);
+    }
+
+    fn apply_minute_sync(&mut self, dir: PathBuf, result: Result<(), String>) {
+        let viewing_stock = self.selected.is_some_and(|idx| self.stocks[idx].1 == dir);
+        match result {
+            Ok(()) => {
+                self.minute_download_errors.remove(&dir);
+                if viewing_stock && self.period.is_intraday() {
+                    self.reload_candles();
+                }
+            }
+            Err(error) => {
+                self.minute_download_errors.insert(dir, error);
+            }
+        }
+    }
+
+    fn show_minute_download(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some((info, dir)) = self.selected.and_then(|idx| self.stocks.get(idx)) else {
+            return;
+        };
+        let auto_syncing_stock = self.auto_sync_secid.as_deref() == Some(info.secid.as_str());
+        let label = if self.candles.is_empty() {
+            "下载5分钟"
+        } else {
+            "更新5分钟"
+        };
+        let clicked = ui
+            .horizontal_wrapped(|ui| {
+                let running = self.minute_download.is_some();
+                let button = ui
+                    .add_enabled(!running && !auto_syncing_stock, egui::Button::new(label))
+                    .on_hover_text("下载该股票的5分钟 K 线（新浪财经，不复权）");
+                if running {
+                    ui.spinner();
+                    ui.label(
+                        if self
+                            .minute_download
+                            .as_ref()
+                            .is_some_and(|job| job.stock_dir == *dir)
+                        {
+                            "下载中…"
+                        } else {
+                            "正在下载另一只股票…"
+                        },
+                    );
+                }
+                if let Some(error) = self.minute_download_errors.get(dir) {
+                    ui.colored_label(egui::Color32::from_rgb(0xef, 0x53, 0x50), error);
+                }
+                button.clicked()
+            })
+            .inner;
+        if clicked {
+            self.start_minute_download(ctx);
+        }
+    }
+
+    /// Syncs both periods for the whole market, favourites or a bundle's matches.
     fn run_sync(&mut self, ctx: &egui::Context, symbols: Option<Vec<String>>) {
+        if self.sync_receiver.is_some() || symbols.as_ref().is_some_and(Vec::is_empty) {
+            return;
+        }
         let settings = load_settings();
+        let data_dir = self.resolve_data_dir(&settings);
+        let selected = self.selected.map(|idx| self.stocks[idx].0.secid.clone());
         let ctx = ctx.clone();
 
         self.sync_status = SyncStatus::Running {
+            period: Period::Daily,
             progress_pct: 0.0,
             completed: 0,
             total: 0,
@@ -653,196 +786,60 @@ impl ChartApp {
         self.sync_receiver = Some(rx);
 
         std::thread::spawn(move || {
-            // Expand ~ in data_dir
-            let data_dir = if settings.dl.data_dir.starts_with("~/") {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                format!("{}/{}", home, &settings.dl.data_dir[2..])
-            } else {
-                settings.dl.data_dir.clone()
-            };
-
-            // New CLI: `stock-dl -o <dir> download [--codes ...] [-c N]`
-            let mut cmd = std::process::Command::new(&settings.dl.binary);
-            cmd.arg("-o").arg(&data_dir);
-            cmd.arg("download");
-            cmd.arg("-c").arg(settings.dl.concurrency.to_string());
-
-            // Limit to favorites/filtered when supplied — new flag is --codes,
-            // which takes bare codes (no market prefix).
-            if let Some(ref syms) = symbols {
-                let codes: Vec<String> = syms
-                    .iter()
-                    .map(|s| strip_secid_prefix(s).to_string())
-                    .collect();
-                cmd.arg("--codes").arg(codes.join(","));
-            }
-
-            cmd.stdout(std::process::Stdio::piped());
-            // stock-dl draws its progress bar on stderr, and only when that is
-            // a terminal: give it a pseudo-terminal and read the bar back.
-            let pty_ours = match stderr_pty() {
-                Some((ours, theirs)) => {
-                    cmd.stderr(theirs);
-                    Some(ours)
-                }
-                None => {
-                    cmd.stderr(std::process::Stdio::piped());
-                    None
-                }
-            };
-
-            eprintln!("[stock-dl] Running: {:?}", cmd);
-
-            let spawned = cmd.spawn();
-            // `cmd` holds our copy of the terminal's child end: close it, or
-            // reading our end would never see stock-dl exit.
-            drop(cmd);
-            let mut child = match spawned {
-                Ok(child) => child,
-                Err(e) => {
-                    let _ = tx.send(SyncMessage::Finished(Err(format!(
-                        "Failed to run {}: {}",
-                        settings.dl.binary, e
-                    ))));
-                    ctx.request_repaint();
-                    return;
-                }
-            };
-
-            let stderr: Box<dyn std::io::Read + Send> = match (pty_ours, child.stderr.take()) {
-                (Some(ours), _) => Box::new(ours),
-                (None, Some(pipe)) => Box::new(pipe),
-                (None, None) => Box::new(std::io::empty()),
-            };
-            let stderr_reader = {
-                let (tx, ctx) = (tx.clone(), ctx.clone());
-                std::thread::spawn(move || read_dl_stderr(stderr, &tx, &ctx))
-            };
-
-            // stdout: the summary, and progress lines from older stock-dl.
-            let stdout = child.stdout.take().unwrap();
-            let reader = std::io::BufReader::new(stdout);
-            // New stock-dl format: separate updated / skipped / failed fields.
-            // Old format: a single `finished: success=N, failed=M` line.
-            let mut last_updated = 0usize;
-            let mut last_skipped = 0usize;
-            let mut last_failed = 0usize;
-
-            for line in reader.lines() {
-                let Ok(line) = line else { continue };
-                eprintln!("[stock-dl] {}", line);
-
-                if let Some((s, f)) = parse_finished_line(&line) {
-                    // Old stock-dl: `finished: success=N, failed=M`
-                    last_updated = s;
-                    last_failed = f;
-                } else if let Some((key, n)) = parse_dl_summary_field(&line) {
-                    // New stock-dl: `  updated  : N`, `  skipped  : N`, `  failed   : N`
-                    match key {
-                        "updated" => last_updated = n,
-                        "skipped" => last_skipped = n,
-                        "failed" => last_failed = n,
-                        _ => {}
-                    }
-                } else if let Some((pct, completed, total, stock_label)) =
-                    parse_progress_line(&line)
-                {
-                    let _ = tx.send(SyncMessage::Progress {
-                        pct,
-                        completed,
-                        total,
-                        stock_label,
-                    });
-                    ctx.request_repaint();
-                }
-            }
-
-            let status = child.wait();
-            let stderr_output = stderr_reader.join().unwrap_or_default();
-
-            // Skipped = already up-to-date, which is a successful outcome.
-            let success = last_updated + last_skipped;
-            let result = match status {
-                Ok(s) if s.success() => Ok((success, last_failed)),
-                Ok(_) => Err(if stderr_output.is_empty() {
-                    "stock-dl exited with error".to_string()
-                } else {
-                    stderr_output
-                }),
-                Err(e) => Err(format!("Process error: {}", e)),
-            };
-
-            let _ = tx.send(SyncMessage::Finished(result));
-            ctx.request_repaint();
+            sync_batch(
+                &settings.dl,
+                data_dir,
+                symbols.as_deref(),
+                selected.as_deref(),
+                &tx,
+                &ctx,
+            );
         });
     }
 
-    /// Fire a background `stock-dl --codes <code>` for the currently selected
-    /// stock if we haven't already tried it this session. No-ops when a batch
-    /// sync is in progress, another auto-sync is in flight, nothing is
-    /// selected, or this stock has already been attempted.
+    /// Sync daily and five-minute candles on the first view of a stock.
     fn try_start_auto_sync(&mut self, ctx: &egui::Context) {
-        if matches!(self.sync_status, SyncStatus::Running { .. }) {
+        if matches!(
+            self.sync_status,
+            SyncStatus::Running {
+                period: Period::Daily,
+                ..
+            }
+        ) {
             return;
         }
         if self.auto_sync_receiver.is_some() {
             return;
         }
         let Some(idx) = self.selected else { return };
-        let secid = self.stocks[idx].0.secid.clone();
+        let (info, stock_dir) = &self.stocks[idx];
+        let secid = info.secid.clone();
         if !self.auto_synced.insert(secid.clone()) {
             return;
         }
-
         self.auto_sync_secid = Some(secid.clone());
 
         let settings = load_settings();
-        let code = strip_secid_prefix(&secid).to_string();
+        let data_dir = stock_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.resolve_data_dir(&settings));
+        let stock_dir = stock_dir.clone();
         let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
         self.auto_sync_receiver = Some(rx);
 
         std::thread::spawn(move || {
-            let data_dir = if settings.dl.data_dir.starts_with("~/") {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                format!("{}/{}", home, &settings.dl.data_dir[2..])
-            } else {
-                settings.dl.data_dir.clone()
-            };
-
-            let mut cmd = std::process::Command::new(&settings.dl.binary);
-            cmd.arg("-o").arg(&data_dir);
-            cmd.arg("download");
-            cmd.arg("--codes").arg(&code);
-
-            eprintln!("[auto-sync] {} -> {:?}", secid, cmd);
-
-            let msg = match cmd.output() {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stdout.is_empty() {
-                        eprintln!("[auto-sync] stdout:\n{}", stdout);
-                    }
-                    if !stderr.is_empty() {
-                        eprintln!("[auto-sync] stderr:\n{}", stderr);
-                    }
-                    if output.status.success() {
-                        Ok(())
-                    } else {
-                        Err(stderr.trim().to_string())
-                    }
-                }
-                Err(e) => Err(format!("failed to run {}: {}", settings.dl.binary, e)),
-            };
-
-            let _ = tx.send((secid, msg));
+            let result = auto_sync_stock(&settings.dl, &data_dir, &secid, stock_dir);
+            let _ = tx.send(result);
             ctx.request_repaint();
         });
     }
 
-    fn resolve_data_dir(&self) -> PathBuf {
-        settings_data_dir(&load_settings())
+    fn resolve_data_dir(&self, settings: &AppSettings) -> PathBuf {
+        self.data_dir_override
+            .clone()
+            .unwrap_or_else(|| settings_data_dir(settings))
     }
 
     /// Scans every stock with bundle `name` in the background. Bundles are
@@ -875,7 +872,7 @@ impl ChartApp {
         };
 
         let ma_windows = settings.ma.clone();
-        let data_dir = self.resolve_data_dir();
+        let data_dir = self.resolve_data_dir(&settings);
         let ctx = ctx.clone();
 
         self.filter_status.insert(
@@ -922,7 +919,7 @@ impl ChartApp {
     /// Keeps `overlay` in step with what is on screen. Cheap to call every
     /// frame: the structures are only recomputed when the key changes.
     fn refresh_overlay(&mut self) {
-        let names = if self.stock_tab == StockTab::Filtered {
+        let names = if self.stock_tab == StockTab::Filtered && !self.period.is_intraday() {
             self.focus_names()
         } else {
             Vec::new()
@@ -1529,11 +1526,10 @@ impl ChartApp {
         }
     }
 
-    fn refresh_stock_list(&mut self) {
-        let data_dir = self.resolve_data_dir();
+    fn refresh_stock_list(&mut self, data_dir: &Path) {
         let prev_secid = self.selected.map(|i| self.stocks[i].0.secid.clone());
 
-        self.stocks = load_stock_list(&data_dir);
+        self.stocks = load_stock_list(data_dir);
 
         if let Some(secid) = prev_secid {
             if let Some(idx) = self.stocks.iter().position(|s| s.0.secid == secid) {
@@ -1553,6 +1549,8 @@ impl ChartApp {
 
 impl eframe::App for ChartApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_minute_download();
+
         // Poll trade-agent result
         if let Some(ref rx) = self.agent_receiver {
             if let Ok(result) = rx.try_recv() {
@@ -1564,44 +1562,55 @@ impl eframe::App for ChartApp {
             }
         }
 
-        // Poll sync progress
-        let mut sync_done = false;
-        if let Some(ref rx) = self.sync_receiver {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    SyncMessage::Progress {
-                        pct,
+        // Daily progress comes from stock-dl. Each minute completion can
+        // refresh the stock on screen while the rest of the batch runs.
+        while let Some(Ok(message)) = self.sync_receiver.as_ref().map(mpsc::Receiver::try_recv) {
+            match message {
+                SyncMessage::Progress {
+                    pct,
+                    completed,
+                    total,
+                    stock_label,
+                } => {
+                    self.sync_status = SyncStatus::Running {
+                        period: Period::Daily,
+                        progress_pct: pct,
                         completed,
                         total,
-                        stock_label,
-                    } => {
-                        self.sync_status = SyncStatus::Running {
-                            progress_pct: pct,
-                            completed,
-                            total,
-                            current_stock: stock_label,
-                        };
-                    }
-                    SyncMessage::Finished(result) => {
-                        match result {
-                            Ok((s, f)) => {
-                                self.sync_status = SyncStatus::Done {
-                                    success: s,
-                                    failed: f,
-                                };
-                            }
-                            Err(e) => {
-                                self.sync_status = SyncStatus::Error(e);
-                            }
-                        }
-                        sync_done = true;
-                    }
+                        current_stock: stock_label,
+                    };
+                }
+                SyncMessage::MinutesStarted { data_dir, total } => {
+                    self.refresh_stock_list(&data_dir);
+                    self.sync_status = SyncStatus::Running {
+                        period: Period::FiveMinutes,
+                        progress_pct: 0.0,
+                        completed: 0,
+                        total,
+                        current_stock: String::new(),
+                    };
+                }
+                SyncMessage::MinuteProgress {
+                    completed,
+                    total,
+                    stock_label,
+                    stock_dir,
+                    result,
+                } => {
+                    self.apply_minute_sync(stock_dir, result);
+                    self.sync_status = SyncStatus::Running {
+                        period: Period::FiveMinutes,
+                        progress_pct: 100.0 * completed as f32 / total as f32,
+                        completed,
+                        total,
+                        current_stock: stock_label,
+                    };
+                }
+                SyncMessage::Finished { daily, minute } => {
+                    self.sync_status = SyncStatus::Done { daily, minute };
+                    self.sync_receiver = None;
                 }
             }
-        }
-        if sync_done {
-            self.sync_receiver = None;
-            self.refresh_stock_list();
         }
 
         // Poll filter scans: every bundle reports through its own channel.
@@ -1656,24 +1665,23 @@ impl eframe::App for ChartApp {
             }
         }
 
-        // Poll single-stock auto-sync
-        if let Some(ref rx) = self.auto_sync_receiver {
-            if let Ok((secid, result)) = rx.try_recv() {
-                if let Err(e) = &result {
-                    eprintln!("[auto-sync] {} failed: {}", secid, e);
-                }
-                self.auto_sync_secid = None;
-                self.auto_sync_receiver = None;
-                // Pull in fresh candles only if the user is still looking at
-                // the stock we just synced.
-                if result.is_ok() {
-                    if let Some(idx) = self.selected {
-                        if self.stocks[idx].0.secid == secid {
-                            self.reload_candles();
-                        }
-                    }
-                }
+        // Only replace the chart if it's still displaying the synced stock.
+        if let Some(Ok(result)) = self
+            .auto_sync_receiver
+            .as_ref()
+            .map(mpsc::Receiver::try_recv)
+        {
+            self.auto_sync_secid = None;
+            self.auto_sync_receiver = None;
+            if result.daily.is_ok()
+                && !self.period.is_intraday()
+                && self
+                    .selected
+                    .is_some_and(|idx| self.stocks[idx].1 == result.stock_dir)
+            {
+                self.reload_candles();
             }
+            self.apply_minute_sync(result.stock_dir, result.minute);
         }
 
         // Kick off an auto-sync for whichever stock is currently on screen
@@ -1841,16 +1849,13 @@ impl eframe::App for ChartApp {
                         } else {
                             "同步数据"
                         };
+                        let favorites_tab = self.stock_tab == StockTab::Favorites;
                         let btn = ui.add_enabled(
-                            !is_syncing,
+                            !is_syncing && (!favorites_tab || !self.favorites.is_empty()),
                             egui::Button::new(egui::RichText::new(btn_text).size(12.0)),
                         );
                         if btn.clicked() {
-                            // On the 自选 tab only those stocks are synced.
-                            let favorites = (self.stock_tab == StockTab::Favorites
-                                && !self.favorites.is_empty())
-                            .then(|| self.favorites.clone());
-                            self.run_sync(ctx, favorites);
+                            self.run_sync(ctx, favorites_tab.then(|| self.favorites.clone()));
                         }
                         if is_syncing {
                             ui.spinner();
@@ -1859,17 +1864,18 @@ impl eframe::App for ChartApp {
                 }
                 match &self.sync_status {
                     SyncStatus::Running {
+                        period,
                         progress_pct,
                         completed,
                         total,
                         current_stock,
                     } => {
                         let bar_pct = *progress_pct / 100.0;
-                        // stock-dl may first spend a while building its stock list.
+                        let label = period.label();
                         let text = if *total == 0 {
-                            "准备中…".to_string()
+                            format!("{label} 准备中…")
                         } else {
-                            format!("{completed}/{total} ({progress_pct:.1}%)")
+                            format!("{label} {completed}/{total} ({progress_pct:.1}%)")
                         };
                         ui.add(egui::ProgressBar::new(bar_pct).text(text));
                         if !current_stock.is_empty() {
@@ -1880,26 +1886,17 @@ impl eframe::App for ChartApp {
                             );
                         }
                     }
-                    SyncStatus::Done { success, failed } => {
-                        let color = if *failed == 0 {
-                            egui::Color32::from_rgb(0x26, 0xa6, 0x9a)
-                        } else {
-                            egui::Color32::from_rgb(0xFF, 0x98, 0x00)
-                        };
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "同步完成: 成功={success}, 失败={failed}"
-                            ))
-                            .size(11.0)
-                            .color(color),
-                        );
-                    }
-                    SyncStatus::Error(msg) => {
-                        ui.label(
-                            egui::RichText::new(format!("同步错误: {msg}"))
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(0xef, 0x53, 0x50)),
-                        );
+                    SyncStatus::Done { daily, minute } => {
+                        match daily {
+                            Ok(counts) => show_sync_counts(ui, Period::Daily, *counts),
+                            Err(msg) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0xef, 0x53, 0x50),
+                                    format!("日线同步失败：{msg}"),
+                                );
+                            }
+                        }
+                        show_sync_counts(ui, Period::FiveMinutes, *minute);
                     }
                     SyncStatus::Idle => {}
                 }
@@ -1951,16 +1948,20 @@ impl eframe::App for ChartApp {
                 }
                 ui.separator();
 
-                let mut changed = false;
-                for p in [Period::Daily, Period::Weekly] {
-                    let btn = ui.selectable_label(self.period == p, p.label());
-                    if btn.clicked() && self.period != p {
-                        self.period = p;
-                        changed = true;
+                let previous_period = self.period;
+                for period in Period::CHART_PERIODS {
+                    if ui
+                        .selectable_label(self.period == period, period.label())
+                        .clicked()
+                    {
+                        self.period = period;
                     }
                 }
-                if changed {
+                if self.period != previous_period {
                     self.reload_candles();
+                    if self.period.is_intraday() || previous_period.is_intraday() {
+                        self.chart_state.fit_to_data(&self.candles);
+                    }
                 }
 
                 // Switch for the structure markers, offered when the stock
@@ -2039,6 +2040,9 @@ impl eframe::App for ChartApp {
                     );
                 });
             });
+            if self.period.is_intraday() {
+                self.show_minute_download(ui, ctx);
+            }
             ui.separator();
 
             self.refresh_overlay();
@@ -2046,12 +2050,6 @@ impl eframe::App for ChartApp {
                 .selected
                 .map(|i| self.stocks[i].0.name.clone())
                 .unwrap_or_default();
-            // Weekly charts span a wider price range per bar, so space the
-            // percentage guide lines further apart to keep the chart readable.
-            let price_level_step = match self.period {
-                Period::Daily => 0.2,
-                Period::Weekly => 0.3,
-            };
             let hidden = MatchedShapes::default();
             draw_chart(
                 ui,
@@ -2060,8 +2058,12 @@ impl eframe::App for ChartApp {
                 &self.ma_visible,
                 &mut self.chart_state,
                 &title,
-                price_level_step,
-                if self.show_overlay { &self.overlay } else { &hidden },
+                self.period,
+                if self.show_overlay {
+                    &self.overlay
+                } else {
+                    &hidden
+                },
             );
         });
 
@@ -2073,14 +2075,260 @@ impl eframe::App for ChartApp {
     }
 }
 
+fn sync_batch(
+    settings: &DlSettings,
+    data_dir: PathBuf,
+    symbols: Option<&[String]>,
+    selected: Option<&str>,
+    tx: &mpsc::Sender<SyncMessage>,
+    ctx: &egui::Context,
+) {
+    let daily = sync_daily_batch(settings, &data_dir, symbols, tx, ctx);
+    // The daily sync may have populated the stock directory on this run.
+    let mut stocks = load_stock_list(&data_dir);
+    if let Some(symbols) = symbols {
+        let codes: HashSet<_> = symbols.iter().map(|s| strip_secid_prefix(s)).collect();
+        stocks.retain(|(info, _)| codes.contains(strip_secid_prefix(&info.secid)));
+    }
+    if let Some(index) = stocks
+        .iter()
+        .position(|(info, _)| Some(info.secid.as_str()) == selected)
+    {
+        stocks.swap(0, index);
+    }
+
+    let _ = tx.send(SyncMessage::MinutesStarted {
+        data_dir,
+        total: stocks.len(),
+    });
+    ctx.request_repaint();
+    let minute = sync_minute_batch(&stocks, settings.concurrency, tx, ctx);
+    let _ = tx.send(SyncMessage::Finished { daily, minute });
+    ctx.request_repaint();
+}
+
+fn auto_sync_stock(
+    settings: &DlSettings,
+    data_dir: &Path,
+    secid: &str,
+    stock_dir: PathBuf,
+) -> AutoSyncResult {
+    let (daily, minute) = std::thread::scope(|scope| {
+        let minute = scope.spawn(|| download_five_minute_bars(secid, &stock_dir));
+        let mut cmd = stock_dl_command(settings, data_dir, Some(&[secid.to_string()]));
+        eprintln!("[auto-sync] {secid} -> {cmd:?}");
+        let daily = cmd
+            .output()
+            .map_err(|e| format!("无法启动 {}：{e}", settings.binary))
+            .and_then(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stdout.trim().is_empty() {
+                    eprintln!("[auto-sync] {stdout}");
+                }
+                if !stderr.trim().is_empty() {
+                    eprintln!("[auto-sync] {stderr}");
+                }
+                let failed = stdout.lines().any(|line| {
+                    parse_finished_line(line).is_some_and(|(_, failed)| failed > 0)
+                        || parse_dl_summary_field(line)
+                            .is_some_and(|(field, value)| field == "failed" && value > 0)
+                });
+                if output.status.success() && !failed {
+                    Ok(())
+                } else {
+                    Err(format!("日线同步失败（{}）", output.status))
+                }
+            });
+        let minute = minute
+            .join()
+            .unwrap_or_else(|_| Err("5分钟下载已中断".into()));
+        (daily, minute)
+    });
+    for (period, result) in [(Period::Daily, &daily), (Period::FiveMinutes, &minute)] {
+        if let Err(error) = result {
+            eprintln!("[auto-sync] {secid} {}：{error}", period.label());
+        }
+    }
+    AutoSyncResult {
+        stock_dir,
+        daily,
+        minute,
+    }
+}
+
+fn show_sync_counts(ui: &mut egui::Ui, period: Period, (success, failed): (usize, usize)) {
+    let color = if failed == 0 {
+        egui::Color32::from_rgb(0x26, 0xa6, 0x9a)
+    } else {
+        egui::Color32::from_rgb(0xff, 0x98, 0x00)
+    };
+    ui.label(
+        egui::RichText::new(format!(
+            "{}同步完成，成功 {success}，失败 {failed}",
+            period.label()
+        ))
+        .size(11.0)
+        .color(color),
+    );
+}
+
+fn sync_daily_batch(
+    settings: &DlSettings,
+    data_dir: &Path,
+    symbols: Option<&[String]>,
+    tx: &mpsc::Sender<SyncMessage>,
+    ctx: &egui::Context,
+) -> Result<(usize, usize), String> {
+    let mut cmd = stock_dl_command(settings, data_dir, symbols);
+    cmd.stdout(std::process::Stdio::piped());
+    // stock-dl draws its progress bar on stderr, and only when that is
+    // a terminal: give it a pseudo-terminal and read the bar back.
+    let pty_ours = match stderr_pty() {
+        Some((ours, theirs)) => {
+            cmd.stderr(theirs);
+            Some(ours)
+        }
+        None => {
+            cmd.stderr(std::process::Stdio::piped());
+            None
+        }
+    };
+
+    eprintln!("[stock-dl] Running: {:?}", cmd);
+
+    let child = cmd.spawn();
+    // Close our copy of the terminal's child end so our reader can see EOF.
+    drop(cmd);
+    let mut child = child.map_err(|e| format!("Failed to run {}: {e}", settings.binary))?;
+
+    let stderr: Box<dyn std::io::Read + Send> = match (pty_ours, child.stderr.take()) {
+        (Some(ours), _) => Box::new(ours),
+        (None, Some(pipe)) => Box::new(pipe),
+        (None, None) => Box::new(std::io::empty()),
+    };
+    let stderr_reader = {
+        let (tx, ctx) = (tx.clone(), ctx.clone());
+        std::thread::spawn(move || read_dl_stderr(stderr, &tx, &ctx))
+    };
+
+    // stdout: the summary, and progress lines from older stock-dl.
+    let stdout = child.stdout.take().unwrap();
+    let reader = std::io::BufReader::new(stdout);
+    // New stock-dl format: separate updated / skipped / failed fields.
+    // Old format: a single `finished: success=N, failed=M` line.
+    let mut last_updated = 0usize;
+    let mut last_skipped = 0usize;
+    let mut last_failed = 0usize;
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        eprintln!("[stock-dl] {}", line);
+
+        if let Some((s, f)) = parse_finished_line(&line) {
+            // Old stock-dl: `finished: success=N, failed=M`
+            last_updated = s;
+            last_failed = f;
+        } else if let Some((key, n)) = parse_dl_summary_field(&line) {
+            // New stock-dl: `  updated  : N`, `  skipped  : N`, `  failed   : N`
+            match key {
+                "updated" => last_updated = n,
+                "skipped" => last_skipped = n,
+                "failed" => last_failed = n,
+                _ => {}
+            }
+        } else if let Some((pct, completed, total, stock_label)) = parse_progress_line(&line) {
+            let _ = tx.send(SyncMessage::Progress {
+                pct,
+                completed,
+                total,
+                stock_label,
+            });
+            ctx.request_repaint();
+        }
+    }
+
+    let status = child.wait();
+    let stderr_output = stderr_reader.join().unwrap_or_default();
+
+    // Skipped = already up-to-date, which is a successful outcome.
+    let success = last_updated + last_skipped;
+    match status {
+        Ok(s) if s.success() => Ok((success, last_failed)),
+        Ok(_) => Err(if stderr_output.is_empty() {
+            "stock-dl exited with error".to_string()
+        } else {
+            stderr_output
+        }),
+        Err(e) => Err(format!("Process error: {}", e)),
+    }
+}
+
+fn stock_dl_command(
+    settings: &DlSettings,
+    data_dir: &Path,
+    symbols: Option<&[String]>,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(&settings.binary);
+    cmd.arg("-o").arg(data_dir).arg("download");
+    cmd.arg("-c").arg(settings.concurrency.to_string());
+    if let Some(symbols) = symbols {
+        let codes = symbols
+            .iter()
+            .map(|s| strip_secid_prefix(s))
+            .collect::<Vec<_>>();
+        cmd.arg("--codes").arg(codes.join(","));
+    }
+    cmd
+}
+
+fn sync_minute_batch(
+    stocks: &[(StockInfo, PathBuf)],
+    concurrency: usize,
+    tx: &mpsc::Sender<SyncMessage>,
+    ctx: &egui::Context,
+) -> (usize, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let total = stocks.len();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (finished, completed) = mpsc::channel();
+        for _ in 0..concurrency.max(1).min(total) {
+            let finished = finished.clone();
+            let next = &next;
+            scope.spawn(move || {
+                while let Some((info, dir)) = stocks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let result = download_five_minute_bars(&info.secid, dir);
+                    if let Err(error) = &result {
+                        eprintln!("[5分钟同步] {}: {error}", info.secid);
+                    }
+                    let _ = finished.send((info, dir, result));
+                }
+            });
+        }
+        drop(finished);
+
+        let mut failed = 0;
+        for (index, (info, dir, result)) in completed.into_iter().enumerate() {
+            failed += usize::from(result.is_err());
+            let _ = tx.send(SyncMessage::MinuteProgress {
+                completed: index + 1,
+                total,
+                stock_label: format!("{} {}", info.secid, info.name),
+                stock_dir: dir.clone(),
+                result,
+            });
+            ctx.request_repaint();
+        }
+        (total - failed, failed)
+    })
+}
+
 /// Strip a `sh`/`sz`/`bj` market prefix so the remaining code matches what
 /// `stock-dl --codes` expects.
 fn strip_secid_prefix(secid: &str) -> &str {
-    if secid.len() > 2 {
-        let prefix = &secid[..2];
-        if matches!(prefix, "sh" | "sz" | "bj") {
-            return &secid[2..];
-        }
+    if secid.len() > 2 && matches!(secid.get(..2), Some("sh" | "sz" | "bj")) {
+        return &secid[2..];
     }
     secid
 }
